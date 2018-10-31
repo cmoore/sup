@@ -1,0 +1,68 @@
+
+* Preface
+
+This isn't a product, or necessarily an "open source project".  It's just a project I've been hacking on for a couple of years now.  If you find it useful that's great, but it's not something I'm going to support.  That's not necessarily meant to discourage bug reports and PRs, but you probably shouldn't submit them with the expectation that I'm going to fix them as soon as I can.  You'll be better off thinking of this as more as an example.
+
+* What
+
+Sup is an... archiving? reddit client.  I guess archiving is the best way to describe it.  It continuously scans the subreddits you are subscribed to and new posts appear in the '/live' route.  When it encounters an image it saves it to disk.  On image heavy subreddits, this can take quite a bit of disk space, but hey, disk space is cheap.
+
+Examples:
+[[./example-images/headshot.png]]
+
+[[./example-images/article.png]]
+
+- The eye icon shows/hides the content.
+- The person icon opens a new tab with all posts from that author.
+- The nametag icon opens a new tab with just that post.  I think I did this for debugging at some point.
+- The safe icon shows a dump of the json data from reddit.
+- The trashcan icon "shadows" a post.  It doesn't show up in any searches, or the archive listing from the links at the top.  Open "/shadowed" to render out the list of shadowed posts.  Just shadow it again from there to unshadow a post.
+- The save (box with a down arrow) marks a post as favorite.
+- The save icon at the bottom will expand the post, pull fresh comments, and renders any images it has found for the post.  The next image is an example of this.
+- Correctly rendering the images and video is an ongoing adventure.  The names at the bottom of posts (like "is-reddit-image") correspond to the functions ~render/video~, etc.  The names should probably be updated.
+
+[[./example-images/article-expanded.png]]
+
+* What do I need to run it?
+
+A lisp, a postgres server, some disk space, and a reddit account and API keys.
+
+* Can you post or upvote with it?
+
+Not at the moment.  I think I'll start small and maybe add the ability to upvote/downvote at some point.
+
+* Getting it running
+- In ~\~/quicklisp/local-projects~
+  - ~git clone git@github.com:cmoore/cl-ivy~
+  - ~git clone git@github.com:cmoore/am~
+  - ~git clone git@github.com:cmoore/sup~
+  - ~cd sup && git submodule update --init~
+- Set up Postgres and create a database.
+  - Load reddit.sql into your database ~psql the-database <./reddit.sql~
+- Log in to reddit and go to https://www.reddit.com/prefs/apps
+  - Create a new application with type "script" and note the key and secret.
+- Edit ~config.sexp~ and plug those values in along with the database host, login, and password, and your reddit login and password.
+- The init.lisp file is how I usually start it, inside tmux and just let it run.  It's known to run just fine with SBCL, Lispworks, and ECL.  I'll probably make whatever changes I need to make to get it to run with ACL as well.
+  - ~sbcl --load init.lisp~ and cross your fingers.
+- Head to ~http://localhost:9000~ and posts should start popping up.
+
+* Good Details
+
+- When a newly subscribed subreddit is detected, it will download *ALL* of its posts, which can be a lot and might make bring your browser to its knees.
+- There are a few functions that don't have an easy way to use them in the interface.
+  - ~(hide-subreddit "subreddit-name")~ Marks all unread messages as read and removes them from the interface.
+  - ~(mark-subreddit-as-read)~
+  - ~(download-entire-internet)~ - useful for when Sup has been off for a while.  This rescans all subscribed subreddits as if they were newly detected and adds any missing posts.
+- Maintains a list of all post ids that it has seen before.
+- Add subreddits by subscribing to them on reddit.
+- Unsubbing from a subreddit wipes the post and image data.
+- Does a reasonable job of ignoring reposts.
+
+* Bad Details
+
+- Almost all of the controls on the posts don't have tooltips.  This is one of those personal project things; I know what they are becase I added them over time, but it's not user-friendly.  The X at the top right of the posts mark them as read.  I'll fix things like this over time.
+- I _think_ that's about it, but I'm sure I'll find more.
+
+* Things I'd like to add at some point
+
+- It might be fun to make an all-in-one releasable build.  That is, just an executable image with all of the js and css stuff in the image.  You'd just need a ~config.sexp~ and point it at a directory to archive images into and it'd run.  I have all of the pieces from other projects, I'd just need to put them together and test it.  I don't know about regularly releasing builds though.  That sounds suspiciously like something I'd do a couple of times and then quit.
