@@ -12,5 +12,7 @@
                :parenscript
                :css-lite
                :cl-who
+               :mailbox
+               :split-sequence
                :cl-mango)
   :components ((:file "sup")))

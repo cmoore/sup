@@ -9,7 +9,7 @@
 (in-package #:sup)
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (setf cl-mango:*host* "localhost")
+  (setf cl-mango:*host* "127.0.0.1")
   (setf cl-mango:*port* 5984)
   (setf cl-mango:*scheme* :http)
   (setf cl-mango:*username* "admin")
@@ -134,7 +134,7 @@
                                                        :content-type "application/json"
                                                        :parameters (list (cons "grant_type" "password")
                                                                          (cons "username" "clintm")
-                                                                         (cons "password" "l1b3r45ion"))
+                                                                         (cons "password" "@fancywalking2"))
                                                        :method :post
                                                        :preserve-uri t)))
                                'access-token)))
@@ -413,7 +413,7 @@
                                                                                  (list (cons "$exists" 'yason:false)))))
                                                         :sort (list (alexandria:alist-hash-table
                                                                      (list (cons "created" "desc"))))
-                                                        :limit 100)))))))
+                                                        :limit 1000)))))))
 
 (defun scan-comments ()
   (mapcar (lambda (link)
@@ -437,6 +437,18 @@
                       (yason:parse data))))
           (link-get-all)))
 
+(defun get-latest-post-id-for-subreddit (subreddit)
+  (log:info "check" subreddit)
+  (let ((dochash (car (gethash "docs"
+                               (yason:parse
+                                (doc-find "reddit"
+                                          (make-selector (list (cons "subreddit" subreddit))
+                                                         :limit 1
+                                                         :sort (list (alexandria:alist-hash-table
+                                                                      (list (cons "created" "desc")))))))))))
+    (when dochash
+      (gethash "id" dochash))))
+
 (defun scan-links ()
   (authenticate)
   (mapc (lambda (sub)
@@ -446,28 +458,35 @@
                   (cl-mango:doc-find "reddit" (make-selector (list (cons "type" "subreddit")))))))
   (get-my-subscribed-subreddits)
   (mapc (lambda (subreddit)
-          (mapc (lambda (tmp)
-                  (let ((new-link (gethash "data" tmp)))
-                    (setf (gethash "type" new-link) "link")
-                    (setf (gethash "written" new-link) (get-universal-time))
-                    (setf (gethash "_id" new-link) (gethash "id" new-link))
-                    (handler-case (cl-mango:doc-put "reddit" (with-output-to-string (sink)
-                                                               (yason:encode new-link sink)))
-                      (cl-mango:unexpected-http-response (condition)
-                        (declare (ignore condition))))))
-                (gethash "children"
-                         (gethash "data"
-                                  (yason:parse
-                                   (drakma:http-request
-                                    (format nil
-                                            "https://www.reddit.com~a.json?limit=100"
-                                            (subreddit-url subreddit))))))))
+          (let ((latest-id (get-latest-post-id-for-subreddit (subreddit-display-name subreddit))))
+            (log:info latest-id)
+            (let ((links (gethash "children"
+                           (gethash "data"
+                                    (yason:parse
+                                     (drakma:http-request
+                                      (if latest-id
+                                          (format nil "https://www.reddit.com~a.json?limit=100&after=~a"
+                                                  (subreddit-url subreddit)
+                                                  latest-id)
+                                          (format nil "https://www.reddit.com~a.json?limit=100"
+                                                  (subreddit-url subreddit)))))))))
+              (log:info "links" (length links))
+              (mapc (lambda (tmp)
+                      (let ((new-link (gethash "data" tmp)))
+                        (setf (gethash "type" new-link) "link")
+                        (setf (gethash "written" new-link) (get-universal-time))
+                        (setf (gethash "_id" new-link) (gethash "id" new-link))
+                        (handler-case (cl-mango:doc-put "reddit" (with-output-to-string (sink)
+                                                                   (yason:encode new-link sink)))
+                          (cl-mango:unexpected-http-response (condition)
+                            (declare (ignore condition))))))
+                    links))))
         (subreddit-get-all)))
 
 (defun refresh ()
   (log:info "Links")
   (scan-links)
-  (sleep 2))
+  (sleep 180))
 
 (defun start-refresh-thread ()
   (bt:make-thread (lambda ()
@@ -508,3 +527,139 @@
                                                                   (list (cons "created" "desc"))))
                                                      :limit 10000)
                              ))))))
+
+
+
+
+
+
+
+
+
+(defparameter *append-box* (mailbox:make-mailbox))
+(defparameter *overwrite-box* (mailbox:make-mailbox))
+
+(defun cap-string (string)
+  (let* ((splitted (split-sequence:split-sequence #\Space string))
+         (first-word (string-capitalize (car splitted)))
+         (correct (format nil "~{~a~^ ~}" (append (list first-word) (cdr splitted)))))
+    correct))
+
+(defun start-boxer-thread ()
+  (bt:make-thread (lambda ()
+                    (loop
+                      (boxer)
+                      (sleep 1)))
+                  :name "boxer"))
+(defun boxer ()
+  (labels ((write-all-overwrites ()
+             (multiple-value-bind (item more)
+                 (mailbox:read-mail *overwrite-box*)
+               (when item
+                 (log:info "overwrite")
+                 (with-open-file (out "~/Desktop/speech.txt"
+                                      :direction :output
+                                      :if-exists :supersede)
+                   (format out "~a.~%" (cap-string item)))
+                 (when more
+                   (write-all-overwrites)))))
+           (write-all-appends ()
+             (multiple-value-bind (item more)
+                 (mailbox:read-mail *append-box*)
+               (when item
+                 (log:info "append")
+                 (with-open-file (out "~/Desktop/speech.txt"
+                                      :direction :output
+                                      :if-exists :append)
+                   (format out "~a." item))
+                 (when more
+                   (write-all-appends))))))
+    (write-all-overwrites)
+    (write-all-appends)))
+
+(defroute append-speech ("/speech/add/append" :method :post) (bundle)
+  (mailbox:post-mail bundle *append-box*)
+  "ok")
+
+(defroute add-speech ("/speech/add/overwrite" :method :post) (bundle)
+  (mailbox:post-mail bundle *overwrite-box*)
+  "ok")
+
+(defroute test ("/speech") ()
+  (with-page ()
+    (:div :class "row"
+      (:div :style "font-size:24px;" :id "output" :class "col-md-6 col-md-offset-3" ""))
+    (:script
+      (who:str
+       (ps
+         (defvar speech nil)
+         ;; (defun append-full (sentence)
+         ;;   (setf (@ (-> document (get-element-by-id "output")) inner-h-t-m-l) sentence))
+         ;; (defun append-partial (sentence)
+         ;;   (incf (@ (-> document (get-element-by-id "output")) inner-h-t-m-l) sentence))
+         (with-document-ready
+             (lambda ()
+               (setf speech (new (webkit-speech-recognition)))
+               (setf (@ speech lang) "en-US")
+               (setf (@ speech continuous) t)
+               (setf (@ speech interim-results) false)
+                                
+               (setf (@ speech onresult) (lambda (event)
+                                           (map (lambda (block)
+                                                  (-> console (log "result"))
+                                                  (when (@ block is-final)
+                                                    (let ((output (@ block 0 transcript))
+                                                          (reg (regex "/^ /")))
+                                                      (if (-> reg (exec output))
+                                                          ((@ $ ajax) (create url "http://localhost:8086/speech/add/append"
+                                                                              data (create "bundle" output)
+                                                                              method "POST"))
+                                                          ((@ $ ajax) (create url "http://localhost:8086/speech/add/overwrite"
+                                                                              data (create "bundle" output)
+                                                                              method "POST"))))))
+                                                (@ event results))))
+               (setf (@ speech onend) (lambda (event)
+                                        (-> console (log "onend"))
+                                        (-> speech (start))))
+               (-> speech (start)))))))))
+
+
+
+(defclass chat-room (hunchensocket:websocket-resource)
+  ((name :initarg :name :initform (error "Name this room!") :reader name))
+  (:default-initargs :client-class 'user))
+
+(defclass user (hunchensocket:websocket-client)
+  ((name :initarg :user-agent :reader name :initform (error "Name this user!"))))
+
+(defvar *chat-rooms* (list (make-instance 'chat-room :name "/ws/cc")
+                           (make-instance 'chat-room :name "/ws/append")))
+
+(defun find-room (request)
+  (find (hunchentoot:script-name request) *chat-rooms* :test #'string= :key #'name))
+
+(pushnew 'find-room hunchensocket:*websocket-dispatch-table*)
+
+(defun broadcast (room message &rest args)
+  (loop for peer in (hunchensocket:clients room)
+        do (hunchensocket:send-text-message peer (apply #'format nil message args))))
+
+(defmethod hunchensocket:client-connected ((room chat-room) user)
+  (hunchensocket:send-text-message user "Connecting to the message bridge...")
+  (attach-queue-handler (lambda (message)
+                          (hunchensocket:send-text-message user
+                                                           (format nil "~a~%"
+                                                                   (flexi-streams:octets-to-string
+                                                                    (cl-rabbit:message/body
+                                                                     (cl-rabbit:envelope/message message))))))))
+
+(defmethod hunchensocket:client-disconnected ((room chat-room) user)
+  (broadcast room "~a has left ~a" (name user) (name room)))
+
+(defmethod hunchensocket:text-message-received ((room chat-room) user message)
+  (broadcast room "~a says ~a" (name user) message))  
+
+(defvar *ws-server* (make-instance 'hunchensocket:websocket-acceptor :port 8087))
+
+(defun start-ws-server ()
+  (hunchentoot:start *ws-server*))
