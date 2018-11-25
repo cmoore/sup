@@ -1,3 +1,4 @@
+;;; -*- mode: Lisp; Syntax: COMMON-LISP; Package: CL-MANGO; Base: 10 eval: (hs-hide-all) -*-
 
 (defpackage :sup
   (:use #:cl
@@ -13,13 +14,10 @@
   (setf cl-mango:*port* 5984)
   (setf cl-mango:*scheme* :http)
   (setf cl-mango:*username* "admin")
-  (setf cl-mango:*password* "h4r01d"))
+  (setf cl-mango:*password* "h4r01d")
 
-(defparameter *client-id* "NgPcSAMcznk3aQ")
-
-(defparameter *client-secret* "nZZdcddz-BbYEVwpwkhiGOjzRoQ")
-
-(defparameter *local-state* (cl-ppcre:regex-replace-all "-" (format nil "~a" (uuid:make-v4-uuid)) ""))
+  (defparameter *client-id* "NgPcSAMcznk3aQ")
+  (defparameter *client-secret* "nZZdcddz-BbYEVwpwkhiGOjzRoQ"))
 
 (defparameter *reddit-user* nil)
 
@@ -87,7 +85,7 @@
 (defmango link "reddit"
   ((reddit-id :accessor link-reddit-id
               :json-type :string
-              :json-key "id")
+              :json-key "reddit-id")
    (subreddit :accessor link-subreddit
                  :json-type :string
                  :json-key "subreddit")
@@ -112,13 +110,20 @@
    (text :accessor link-text
          :json-type :string
          :json-key "selftext")
+   (thumbnail :accessor link-thumbnail
+              :json-type :string
+              :json-key "thumbnail")
    (created :accessor link-created
             :json-type :number
             :json-key "created")
    (written :accessor link-written
             :json-type :number
             :json-key "written"
-            :initform (get-universal-time))))
+            :initform (get-universal-time))
+   (suphidden :accessor link-suphidden
+              :json-type :bool
+              :json-key "suphidden"
+              :initform nil)))
 
 (defun make-request (url)
   (drakma:http-request (format nil "~a~a" "https://www.reddit.com" url)))
@@ -134,29 +139,18 @@
                                                        :content-type "application/json"
                                                        :parameters (list (cons "grant_type" "password")
                                                                          (cons "username" "clintm")
-                                                                         (cons "password" "@fancywalking2"))
+                                                                         (cons "password" "@Fancywalking2reddit"))
                                                        :method :post
                                                        :preserve-uri t)))
                                'access-token)))
 
 (defun reddit-request (path)
-  (drakma:http-request
-   (format nil "https://oauth.reddit.com~a" path)
-   :additional-headers (list
-                        (cons "User-Agent" "supyawl/0.1 by clintm")
-                        (cons "Authorization" (format nil
-                                                      "bearer ~a"
-                                                      (access-token-access-token *reddit-user*))))))
-
-(defun get-my-subscribed-subreddits ()
-  (mapcar (lambda (x)
-            (let ((subreddit (json-mop:json-to-clos (with-output-to-string (sink)
-                                                      (yason:encode (gethash "data" x) sink))
-                                                    'subreddit)))
-              (unless (subreddit-find (list (cons "id" (subreddit-reddit-id subreddit))))
-                (subreddit-put subreddit))))
-          (gethash "children" (gethash "data" (yason:parse
-                                               (reddit-request "/subreddits/mine"))))))
+  (drakma:http-request (format nil "https://oauth.reddit.com~a" path)
+                       :additional-headers (list
+                                            (cons "User-Agent" "supyawl/0.1 by clintm")
+                                            (cons "Authorization" (format nil
+                                                                          "bearer ~a"
+                                                                          (access-token-access-token *reddit-user*))))))
 
 (defparameter *listener* nil)
 
@@ -198,12 +192,9 @@
 (defmacro with-page ((&key
                         (title nil)
                         (css nil)
-                        (white-header t)
                         (body-class nil)
-                        (enable-top-toolbar nil)
                         (enable-page-header nil)
-                        (js nil)
-                        (js-init nil)) &body body)
+                        (js nil)) &body body)
   `(let ((who:*html-no-indent-tags* (list :pre :textarea :input :form)))
      (cl-who:with-html-output-to-string
          (*standard-output* nil :indent nil :prologue t)
@@ -217,36 +208,14 @@
             (:meta :name "viewport" :content "width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no")
             (:link :rel "stylesheet" :type "text/css" :href "https://r.ivy.io/am/lib/stroke-7/style.css")
             (:link :rel "stylesheet" :type "text/css" :href "https://r.ivy.io/am/lib/jquery.nanoscroller/css/nanoscroller.css")
-            ,(unless enable-top-toolbar
-               '(:style :type "text/css"
-                 (who:str (css-lite:css ((".am-wrapper") (:padding-top "0px !important"))))))
+            (:style :type "text/css"
+              (who:str (css-lite:css ((".am-wrapper") (:padding-top "0px !important")))))
             ,@(when css
                 `,css)
             (:link :rel "stylesheet" :type "text/css" :href "https://r.ivy.io/am/css/style.css")
             (:script :src "https://r.ivy.io/am/lib/jquery/jquery.min.js"))
-          (:body ,@(when body-class `(:class ,body-class))
-            (:div :class ,(format nil "am-wrapper am-nosidebar-left ~a" (or (and white-header "am-white-header")
-                                                                            ""))
-              ,(when enable-top-toolbar
-                 `(:nav :class "navbar navbar-default navbar-fixed-top am-top-header"
-                    (:div :class "container-fluid"
-                      (:div :class "navbar-header"
-                        (:div :class "page-title"
-                          (:span ,title))
-                        (:a :href "/" :class "navbar-brand"))
-                      (:a :href "#" :data-toggle "collapsed" :data-target "#am-navbar-collapse" :class "am-toggle-top-header-menu collapsed"
-                        (:span :class "icon s7-angle-down"))
-                      (:div :id "am-navbar-collapse" :class "collapse navbar-collapse"
-                        (:ul :class "nav navbar-nav am-nav-right"
-                          (:li (:a :href "/" "Home"))
-                          (when (string= (person-role *greg-person*) "customer")
-                            (who:htm
-                             (:li (:a :href "/media" "Media"))
-                             (:li (:a :href "/customer/setup" "Add Business")))))
-                        (:ul :class "nav navbar-nav navbar-right am-icons-nav"
-                          (if *greg-person*
-                              (who:htm (:li :class "pull-right "(:a :href "/logout" "Logout")))
-                              (who:htm (:li :class "pull-right" (:a :href "/login" "Login")))))))))
+          (:body :style "background-color:black;" ,@(when body-class `(:class ,body-class))
+            (:div :class "am-wrapper am-nosidebar-left"
               (:div :class "am-content"
                 ,(when enable-page-header
                    '(:div :class "page-head"
@@ -263,6 +232,151 @@
             (:script :src "https://r.ivy.io/gfycat.min.js")
             ,@(when js
                 `,js)))))))
+
+(defun get-imgur-id (link)
+  (when (ppcre:scan "imgur.com" link)
+    (cond
+      
+      ((ppcre:scan "https://imgur.com/a/" link)
+       (ppcre:regex-replace "https://imgur.com/a/" link ""))
+
+      ((ppcre:scan "https://imgur.com/gallery/" link)
+       (ppcre:regex-replace "https://imgur.com/gallery/" link ""))
+
+      ((ppcre:scan "https://imgur.com/" link)
+       (ppcre:regex-replace "https://imgur.com/" link ""))
+
+      ((ppcre:scan "https://i.imgur.com/" link)
+       (ppcre:regex-replace ".gifv|.jpg|.gif|.png"
+                            (ppcre:regex-replace "https://i.imgur.com[/a|/]" link "")
+                            ""))
+      ((ppcre:scan "i.imgur.com" link)
+       (ppcre:regex-replace "https://imgur.com/" link ""))
+
+      (t nil))))
+
+(defun get-images-from-doc-hash (doc-hash)
+  (alexandria:when-let* ((preview (gethash "preview" doc-hash))
+                         (images (gethash "images" preview)))
+    images))
+
+(defun scan-comments ()
+  (mapcar (lambda (link)
+            (log:info "link")
+            (let ((data (drakma:http-request
+                         (format nil
+                                 "https://www.reddit.com~acomments.json?limit=100"
+                                 (gethash "permalink" link)))))
+              (mapcar (lambda (listing)
+                        (mapcar (lambda (comment)
+                                  (let ((new-comment (gethash "data" comment)))
+                                    (unless (comment-find (list (cons "reddit-id" (gethash "id" new-comment))))
+                                      (setf (gethash "type" new-comment) "comment")
+                                      (handler-case (doc-put "reddit" (with-output-to-string (sink)
+                                                                        (yason:encode new-comment sink)))
+                                        (cl-mango:unexpected-http-response (condition)
+                                          (declare (ignore condition))
+                                          (log:info "caught error"))))))
+                                (gethash "children" (gethash "data" listing))))
+                      (yason:parse data))))
+          (gethash "docs"
+                   (yason:parse
+                    (doc-find "reddit" (make-selector (list (cons "type" "link")
+                                                            (cons "suphidden" (alexandria:alist-hash-table
+                                                                               (list (cons "$exists" 'yason:false)))))))))))
+
+(defun get-latest-post-id-for-subreddit (subreddit)
+  (let ((dochash (car (gethash "docs"
+                               (yason:parse
+                                (doc-find "reddit"
+                                          (make-selector (list (cons "subreddit" subreddit))
+                                                         :limit 1
+                                                         :sort (list (alexandria:alist-hash-table
+                                                                      (list (cons "created" "desc")))))))))))
+    (when dochash
+      (gethash "reddit-id" dochash))))
+
+(defun scan-links ()
+  (authenticate)
+
+  ;; Remove all subreddits.
+  (map 'nil (lambda (sub)
+              (cl-mango:doc-delete "reddit"
+                                   (gethash "_id" sub)
+                                   (gethash "_rev" sub)))
+       (gethash "docs"
+                (yason:parse
+                 (cl-mango:doc-find "reddit" (make-selector
+                                              (list
+                                               (cons "type" "subreddit"))
+                                              :limit 1000)))))
+
+  ;; Read subreddits back from reddit.
+  (map 'nil (lambda (x)
+              (let ((subreddit (json-mop:json-to-clos
+                                (with-output-to-string (sink)
+                                  (yason:encode (gethash "data" x) sink))
+                                'subreddit)))
+                (unless (subreddit-find
+                         (list (cons "display_name" (subreddit-display-name subreddit))
+                               (cons "type" "subreddit")))
+                  (subreddit-put subreddit))))
+       (gethash "children" (gethash "data" (yason:parse
+                                            (reddit-request "/subreddits/mine")))))
+
+  (mapc (lambda (subreddit)
+          (let ((latest-id (get-latest-post-id-for-subreddit
+                            (subreddit-display-name subreddit))))
+            (let ((links (gethash "children"
+                                  (gethash "data"
+                                           (yason:parse
+                                            (drakma:http-request
+                                             (if latest-id
+                                                 (format nil "https://www.reddit.com~a.json?limit=100&after=~a"
+                                                         (subreddit-url subreddit)
+                                                         latest-id)
+                                                 (format nil "https://www.reddit.com~a.json?limit=100"
+                                                         (subreddit-url subreddit)))))))))
+              (mapc (lambda (tmp)
+                      (let ((new-link (gethash "data" tmp)))
+                        (unless (link-find (list (cons "reddit-id" (gethash "id" new-link))))
+                          (setf (gethash "type" new-link) "link")
+                          (setf (gethash "written" new-link) (get-universal-time))
+                          (setf (gethash "reddit-id" new-link) (gethash "id" new-link))
+                          (handler-case (cl-mango:doc-put "reddit" (with-output-to-string (sink)
+                                                                     (yason:encode new-link sink)))
+                            (cl-mango:unexpected-http-response (condition)
+                              (declare (ignore condition))
+                              nil)))))
+                    links))))
+        (subreddit-get-all)))
+
+(defun refresh ()
+  (scan-links)
+  ;;(scan-comments)
+  (sleep 180))
+
+(defun start-refresh-thread ()
+  (bt:make-thread (lambda ()
+                    (loop
+                      (refresh)
+                      nil))
+                  :name "thresher"))
+
+(defun mark-all-as-read ()
+  (length
+   (mapc (lambda (x)
+           (setf (gethash "suphidden" x) 't)
+           (cl-mango:doc-put "reddit" (with-output-to-string (sink)
+                                        (yason:encode x sink))))
+         (gethash "docs"
+                  (yason:parse
+                   (doc-find "reddit" (make-selector (list (cons "type" "link")
+                                                           (cons "suphidden" (alexandria:alist-hash-table
+                                                                              (list (cons "$exists" 'yason:false)))))
+                                                     :sort (list (alexandria:alist-hash-table
+                                                                  (list (cons "created" "desc"))))
+                                                     :limit 1000)))))))
 
 (defroute comments "/comments" ()
   (with-page ()
@@ -294,372 +408,75 @@
               (subreddit-get-all)))))
 
 (defroute hide-link ("/link/hide/:id") ()
-  (let ((the-link (car (gethash "docs"
-                                (yason:parse
-                                 (cl-mango:doc-find "reddit"
-                                                    (make-selector (list (cons "id" id)))))))))
+  (let ((the-link (car (link-find (list (cons "reddit-id" id))))))
     (when the-link
-      (setf (gethash "suphidden" the-link) t)
-      (cl-mango:doc-put "reddit" (with-output-to-string (sink)
-                                   (yason:encode the-link sink)))))
+      (setf (link-suphidden the-link) t)
+      (link-update the-link)))
   "ok")
 
-(defun get-imgur-id (link)
-  (when (ppcre:scan "imgur.com" link)
-    (cond
-      
-      ((ppcre:scan "https://imgur.com/a/" link)
-       (ppcre:regex-replace "https://imgur.com/a/" link ""))
-
-      ((ppcre:scan "https://imgur.com/gallery/" link)
-       (ppcre:regex-replace "https://imgur.com/gallery/" link ""))
-
-      ((ppcre:scan "https://imgur.com/" link)
-       (ppcre:regex-replace "https://imgur.com/" link ""))
-
-      ((ppcre:scan "https://i.imgur.com/" link)
-       (ppcre:regex-replace ".gifv|.jpg|.gif|.png"
-                            (ppcre:regex-replace "https://i.imgur.com[/a|/]" link "")
-                            ""))
-      ((ppcre:scan "i.imgur.com" link)
-       (ppcre:regex-replace "https://imgur.com/" link ""))
-
-      (t nil))))
-
 (defroute links ("/links") ()
+  (declare (optimize (debug 3)))
   (with-page (:js ((:script
                      (who:str
-                      (ps:ps (-> document (add-event-listener "DOMContentLoaded" (@ gfy-collection init) nil)))))))
+                      (ps:ps (-> document
+                                 (add-event-listener "DOMContentLoaded"
+                                                     (@ gfy-collection init) nil)))))))
     (mapcar (lambda (doc-hash)
               (who:htm
-               (:div :class "row" :id (format nil "wx~a" (gethash "id" doc-hash))
+               (:div :class "row" :id (format nil "wx~a" (gethash "reddit-id" doc-hash))
                  (:div :class "col-md-7 col-md-offset-3"
                    (:div :class "panel panel-default panel-borders"
                      (:div :class "panel-heading"
-                       (:button :id (format nil "hide-~a" (gethash "id" doc-hash))
+                       (:button :id (format nil "hide-~a" (gethash "reddit-id" doc-hash))
                          :class "btn btn-xs btn-default pull-right" "Close")
                        (alexandria:when-let ((title (gethash "title" doc-hash)))
-                         (who:str title)
+                         (alexandria:if-let ((url (gethash "url" doc-hash)))
+                           (who:htm (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
+                                      :href url (who:str title)))
+                           (who:str title))
                          (who:htm (:br)))
                        (:a
                          :target (format nil "win-~a" (uuid:make-v4-uuid))
-                         :href (format nil "http://localhost:5984/_utils/#database/reddit/~a" (gethash "id" doc-hash))
-                         (who:str (gethash "id" doc-hash)))
-                       (who:str (format nil "   ~a/~a" (gethash "ups" doc-hash) (gethash "downs" doc-hash)))
+                         :href (format nil "http://localhost:5984/_utils/#database/reddit/~a"
+                                       (gethash "reddit-id" doc-hash))
+                         (who:str (gethash "reddit-id" doc-hash)))
+                       (who:str (format nil "   ~a/~a"
+                                        (gethash "ups" doc-hash)
+                                        (gethash "downs" doc-hash)))
 
                        (:script (who:str
                                  (ps:ps*
-                                  `(-> (sel ,(format nil "#hide-~a" (gethash "id" doc-hash)))
-                                       (click (lambda (e)
-                                                (-> (sel ,(format nil "#wx~a" (gethash "id" doc-hash)))
-                                                    (load ,(format nil "/link/hide/~a" (gethash "id" doc-hash))))
-                                                (-> (sel ,(format nil "#wx~a" (gethash "id" doc-hash))) (toggle))
-                                                (-> e (prevent-default)))))))))
+                                  `(with-document-ready
+                                       (lambda ()
+                                         (-> (sel ,(format nil "#hide-~a" (gethash "reddit-id" doc-hash)))
+                                             (click (lambda (e)
+                                                      (chain (sel ,(format nil "#wx~a" (gethash "reddit-id" doc-hash)))
+                                                             (load ,(format nil
+                                                                            "/link/hide/~a"
+                                                                            (gethash "reddit-id" doc-hash))))
+                                                      (-> (sel ,(format nil "#wx~a" (gethash "reddit-id" doc-hash)))
+                                                          (toggle))
+                                                      (-> e (prevent-default)))))))))))
                      (:div :class "panel-body"
                        (alexandria:when-let ((selftext (gethash "selftext" doc-hash)))
                          (who:str (gethash "selftext" doc-hash)))
-                       (alexandria:when-let ((link (gethash "link" doc-hash)))
-                         (who:htm
-                          (who:str link)
-                          (:br)))
-                       (alexandria:when-let ((url (gethash "url" doc-hash)))
-                         (when (ppcre:scan "gfycat" url)
-                           (let ((gfyid (ppcre:regex-replace-all "https://gfycat.com/"
-                                                                 url
-                                                                 "")))
-                             (who:htm (:div :class "gfyitem" :data-id gfyid))))
-                         
-                         (when (ppcre:scan "imgur.com" url)
-                           (let* ((the-url (gethash "url" doc-hash))
-                                  (imgurid (get-imgur-id the-url)))
-                             (cond
-                               
-                               ((ppcre:scan ".gifv" the-url)
-                                (who:htm
-                                 (:img :class "img-responsive"
-                                   :src (ppcre:regex-replace ".gifv" the-url ".gif"))))
-                               
-                               ((or (= 6 (length imgurid))
-                                    (= 7 (length imgurid)))
-                                (who:htm
-                                 (:blockquote :class "imgur-embed-pub" :lang "en" :data-id imgurid)
-                                 (:script :async t :src "//s.imgur.com/min/embed.js")))
-                               
-                               (t (progn
-                                    (who:str the-url)
-                                    (who:htm (:br))
-                                    (who:str imgurid)))))
-                           
-                           (who:htm (:br))
-                           ;; (let ((imgurid (get-imgur-id url)))
-                           ;;   (if (= (length imgurid) 7)
-                           ;;       (who:htm
-                           ;;        (who:str imgurid)
-                           ;;        (:img :src url :class "img-responsive"))))
-                           )
-                         (when (ppcre:scan ".jpg|.png|.gif" url)
-                           (who:htm (:img :src url :class "img-responsive"))))
+                       (alexandria:when-let ((images (get-images-from-doc-hash doc-hash)))
+                         (map 'nil (lambda (image)
+                                     (alexandria:when-let* ((resolutions (gethash "resolutions" image))
+                                                            (image-url (gethash "url" (car (reverse resolutions)))))
+                                       (who:htm
+                                        (:img :class "img-responsive" :src image-url))))
+                              images))
+                       (who:str (gethash "url" doc-hash))
                        (:br)
                        (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
                          :href (format nil "https://www.reddit.com~a" (gethash "permalink" doc-hash))
-                         (who:str (gethash "subreddit" doc-hash)))
-                       (:br)
-                       (who:str (gethash "url" doc-hash))))))))
-
+                         (who:str (gethash "subreddit" doc-hash)))))))))
             (gethash "docs"
                      (yason:parse
                       (doc-find "reddit" (make-selector (list (cons "type" "link")
                                                               (cons "suphidden" (alexandria:alist-hash-table
                                                                                  (list (cons "$exists" 'yason:false)))))
                                                         :sort (list (alexandria:alist-hash-table
-                                                                     (list (cons "created" "desc"))))
-                                                        :limit 1000)))))))
-
-(defun scan-comments ()
-  (mapcar (lambda (link)
-            (log:info "link")
-            (let ((data (drakma:http-request
-                         (format nil
-                                 "https://www.reddit.com~acomments.json?limit=100"
-                                 (link-permalink link)))))
-              (mapcar (lambda (listing)
-                        (mapcar (lambda (comment)
-                                  (let ((new-comment (json-mop:json-to-clos
-                                                      (with-output-to-string (sink)
-                                                        (yason:encode (gethash "data" comment) sink))
-                                                      'comment)))
-                                    (unless (comment-find (list (cons "id" (comment-reddit-id new-comment))))
-                                      (handler-case (comment-put new-comment)
-                                        (cl-mango:unexpected-http-response (condition)
-                                          (declare (ignore condition))
-                                          (log:info "caught error"))))))
-                                (gethash "children" (gethash "data" listing))))
-                      (yason:parse data))))
-          (link-get-all)))
-
-(defun get-latest-post-id-for-subreddit (subreddit)
-  (log:info "check" subreddit)
-  (let ((dochash (car (gethash "docs"
-                               (yason:parse
-                                (doc-find "reddit"
-                                          (make-selector (list (cons "subreddit" subreddit))
-                                                         :limit 1
-                                                         :sort (list (alexandria:alist-hash-table
-                                                                      (list (cons "created" "desc")))))))))))
-    (when dochash
-      (gethash "id" dochash))))
-
-(defun scan-links ()
-  (authenticate)
-  (mapc (lambda (sub)
-          (cl-mango:doc-delete "reddit" (gethash "_id" sub) (gethash "_rev" sub)))
-        (gethash "docs"
-                 (yason:parse
-                  (cl-mango:doc-find "reddit" (make-selector (list (cons "type" "subreddit")))))))
-  (get-my-subscribed-subreddits)
-  (mapc (lambda (subreddit)
-          (let ((latest-id (get-latest-post-id-for-subreddit (subreddit-display-name subreddit))))
-            (log:info latest-id)
-            (let ((links (gethash "children"
-                           (gethash "data"
-                                    (yason:parse
-                                     (drakma:http-request
-                                      (if latest-id
-                                          (format nil "https://www.reddit.com~a.json?limit=100&after=~a"
-                                                  (subreddit-url subreddit)
-                                                  latest-id)
-                                          (format nil "https://www.reddit.com~a.json?limit=100"
-                                                  (subreddit-url subreddit)))))))))
-              (log:info "links" (length links))
-              (mapc (lambda (tmp)
-                      (let ((new-link (gethash "data" tmp)))
-                        (setf (gethash "type" new-link) "link")
-                        (setf (gethash "written" new-link) (get-universal-time))
-                        (setf (gethash "_id" new-link) (gethash "id" new-link))
-                        (handler-case (cl-mango:doc-put "reddit" (with-output-to-string (sink)
-                                                                   (yason:encode new-link sink)))
-                          (cl-mango:unexpected-http-response (condition)
-                            (declare (ignore condition))))))
-                    links))))
-        (subreddit-get-all)))
-
-(defun refresh ()
-  (log:info "Links")
-  (scan-links)
-  (sleep 180))
-
-(defun start-refresh-thread ()
-  (bt:make-thread (lambda ()
-                    (loop
-                      (refresh)
-                      nil))
-                  :name "thresher"))
-
-(defun clean-out ()
-  (mapc (lambda (d)
-          (doc-delete "reddit"
-                      (gethash "_id" d)
-                      (gethash "_rev" d)))
-        (gethash "docs"
-                 (yason:parse
-                  (doc-find "reddit"
-                            (make-selector (list (cons "type" "link") (cons "subreddit" "carcrash"))))))))
-(defun clean-out ()
-  (let ((links (link-find-explicit (list (cons "type" "link")) :limit 100)))
-    (when (< 0 (length links))
-      (log:info (length links))
-      (mapc #'link-delete links)
-      (log:info "step")
-      (clean-out))))
-
-(defun mark-all-as-read ()
-  (length
-   (mapc (lambda (x)
-           (setf (gethash "suphidden" x) 't)
-           (cl-mango:doc-put "reddit" (with-output-to-string (sink)
-                                        (yason:encode x sink))))
-         (gethash "docs"
-                  (yason:parse
-                   (doc-find "reddit" (make-selector (list (cons "type" "link")
-                                                           (cons "suphidden" (alexandria:alist-hash-table
-                                                                              (list (cons "$exists" 'yason:false)))))
-                                                     :sort (list (alexandria:alist-hash-table
-                                                                  (list (cons "created" "desc"))))
-                                                     :limit 10000)
-                             ))))))
-
-
-
-
-
-
-
-
-
-(defparameter *append-box* (mailbox:make-mailbox))
-(defparameter *overwrite-box* (mailbox:make-mailbox))
-
-(defun cap-string (string)
-  (let* ((splitted (split-sequence:split-sequence #\Space string))
-         (first-word (string-capitalize (car splitted)))
-         (correct (format nil "~{~a~^ ~}" (append (list first-word) (cdr splitted)))))
-    correct))
-
-(defun start-boxer-thread ()
-  (bt:make-thread (lambda ()
-                    (loop
-                      (boxer)
-                      (sleep 1)))
-                  :name "boxer"))
-(defun boxer ()
-  (labels ((write-all-overwrites ()
-             (multiple-value-bind (item more)
-                 (mailbox:read-mail *overwrite-box*)
-               (when item
-                 (log:info "overwrite")
-                 (with-open-file (out "~/Desktop/speech.txt"
-                                      :direction :output
-                                      :if-exists :supersede)
-                   (format out "~a.~%" (cap-string item)))
-                 (when more
-                   (write-all-overwrites)))))
-           (write-all-appends ()
-             (multiple-value-bind (item more)
-                 (mailbox:read-mail *append-box*)
-               (when item
-                 (log:info "append")
-                 (with-open-file (out "~/Desktop/speech.txt"
-                                      :direction :output
-                                      :if-exists :append)
-                   (format out "~a." item))
-                 (when more
-                   (write-all-appends))))))
-    (write-all-overwrites)
-    (write-all-appends)))
-
-(defroute append-speech ("/speech/add/append" :method :post) (bundle)
-  (mailbox:post-mail bundle *append-box*)
-  "ok")
-
-(defroute add-speech ("/speech/add/overwrite" :method :post) (bundle)
-  (mailbox:post-mail bundle *overwrite-box*)
-  "ok")
-
-(defroute test ("/speech") ()
-  (with-page ()
-    (:div :class "row"
-      (:div :style "font-size:24px;" :id "output" :class "col-md-6 col-md-offset-3" ""))
-    (:script
-      (who:str
-       (ps
-         (defvar speech nil)
-         ;; (defun append-full (sentence)
-         ;;   (setf (@ (-> document (get-element-by-id "output")) inner-h-t-m-l) sentence))
-         ;; (defun append-partial (sentence)
-         ;;   (incf (@ (-> document (get-element-by-id "output")) inner-h-t-m-l) sentence))
-         (with-document-ready
-             (lambda ()
-               (setf speech (new (webkit-speech-recognition)))
-               (setf (@ speech lang) "en-US")
-               (setf (@ speech continuous) t)
-               (setf (@ speech interim-results) false)
-                                
-               (setf (@ speech onresult) (lambda (event)
-                                           (map (lambda (block)
-                                                  (-> console (log "result"))
-                                                  (when (@ block is-final)
-                                                    (let ((output (@ block 0 transcript))
-                                                          (reg (regex "/^ /")))
-                                                      (if (-> reg (exec output))
-                                                          ((@ $ ajax) (create url "http://localhost:8086/speech/add/append"
-                                                                              data (create "bundle" output)
-                                                                              method "POST"))
-                                                          ((@ $ ajax) (create url "http://localhost:8086/speech/add/overwrite"
-                                                                              data (create "bundle" output)
-                                                                              method "POST"))))))
-                                                (@ event results))))
-               (setf (@ speech onend) (lambda (event)
-                                        (-> console (log "onend"))
-                                        (-> speech (start))))
-               (-> speech (start)))))))))
-
-
-
-;; (defclass chat-room (hunchensocket:websocket-resource)
-;;   ((name :initarg :name :initform (error "Name this room!") :reader name))
-;;   (:default-initargs :client-class 'user))
-
-;; (defclass user (hunchensocket:websocket-client)
-;;   ((name :initarg :user-agent :reader name :initform (error "Name this user!"))))
-
-;; (defvar *chat-rooms* (list (make-instance 'chat-room :name "/ws/cc")
-;;                            (make-instance 'chat-room :name "/ws/append")))
-
-;; (defun find-room (request)
-;;   (find (hunchentoot:script-name request) *chat-rooms* :test #'string= :key #'name))
-
-;; (pushnew 'find-room hunchensocket:*websocket-dispatch-table*)
-
-;; (defun broadcast (room message &rest args)
-;;   (loop for peer in (hunchensocket:clients room)
-;;         do (hunchensocket:send-text-message peer (apply #'format nil message args))))
-
-;; (defmethod hunchensocket:client-connected ((room chat-room) user)
-;;   (hunchensocket:send-text-message user "Connecting to the message bridge...")
-;;   (attach-queue-handler (lambda (message)
-;;                           (hunchensocket:send-text-message user
-;;                                                            (format nil "~a~%"
-;;                                                                    (flexi-streams:octets-to-string
-;;                                                                     (cl-rabbit:message/body
-;;                                                                      (cl-rabbit:envelope/message message))))))))
-
-;; (defmethod hunchensocket:client-disconnected ((room chat-room) user)
-;;   (broadcast room "~a has left ~a" (name user) (name room)))
-
-;; (defmethod hunchensocket:text-message-received ((room chat-room) user message)
-;;   (broadcast room "~a says ~a" (name user) message))  
-
-;; (defvar *ws-server* (make-instance 'hunchensocket:websocket-acceptor :port 8087))
-
-;; (defun start-ws-server ()
-;;   (hunchentoot:start *ws-server*))
+                                                                     (list (cons "created" "asc"))))
+                                                        :limit 500)))))))
