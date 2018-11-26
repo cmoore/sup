@@ -83,47 +83,47 @@
               :json-key "id")))
 
 (defmango link "reddit"
-  ((reddit-id :accessor link-reddit-id
-              :json-type :string
-              :json-key "reddit-id")
-   (subreddit :accessor link-subreddit
+          ((reddit-id :accessor link-reddit-id
+                      :json-type :string
+                      :json-key "reddit-id")
+           (subreddit :accessor link-subreddit
+                      :json-type :string
+                      :json-key "subreddit")
+           (title :accessor link-title
+                  :json-type :string
+                  :json-key "title")
+           (permalink :accessor link-permalink
+                      :json-type :string
+                      :json-key "permalink")
+           (url :accessor link-url
+                :json-type :string
+                :json-key "url")
+           (author :accessor link-author
+                   :json-type :string
+                   :json-key "author")
+           (downs :accessor link-downs
+                  :json-type :number
+                  :json-key "downs")
+           (ups :accessor link-ups
+                :json-type :number
+                :json-key "ups")
+           (text :accessor link-text
                  :json-type :string
-                 :json-key "subreddit")
-   (title :accessor link-title
-          :json-type :string
-          :json-key "title")
-   (permalink :accessor link-permalink
-              :json-type :string
-              :json-key "permalink")
-   (url :accessor link-url
-        :json-type :string
-        :json-key "url")
-   (author :accessor link-author
-           :json-type :string
-           :json-key "author")
-   (downs :accessor link-downs
-          :json-type :number
-          :json-key "downs")
-   (ups :accessor link-ups
-        :json-type :number
-        :json-key "ups")
-   (text :accessor link-text
-         :json-type :string
-         :json-key "selftext")
-   (thumbnail :accessor link-thumbnail
-              :json-type :string
-              :json-key "thumbnail")
-   (created :accessor link-created
-            :json-type :number
-            :json-key "created")
-   (written :accessor link-written
-            :json-type :number
-            :json-key "written"
-            :initform (get-universal-time))
-   (suphidden :accessor link-suphidden
-              :json-type :bool
-              :json-key "suphidden"
-              :initform nil)))
+                 :json-key "selftext")
+           (thumbnail :accessor link-thumbnail
+                      :json-type :string
+                      :json-key "thumbnail")
+           (created :accessor link-created
+                    :json-type :number
+                    :json-key "created")
+           (written :accessor link-written
+                    :json-type :number
+                    :json-key "written"
+                    :initform (get-universal-time))
+           (suphidden :accessor link-suphidden
+                      :json-type :bool
+                      :json-key "suphidden"
+                      :initform nil)))
 
 (defun make-request (url)
   (drakma:http-request (format nil "~a~a" "https://www.reddit.com" url)))
@@ -134,7 +134,7 @@
                                 (let ((drakma:*text-content-types* (list (list "application/json"))))
                                   (drakma:http-request "https://www.reddit.com/api/v1/access_token"
                                                        :basic-authorization (list *client-id* *client-secret*)
-                                                       ;;:additional-headers (list (cons "User-Agent" "Supyawl/0.1 by clintm"))
+                                                       :additional-headers (list (cons "User-Agent" "Supyawl/0.1 by clintm"))
                                                        :accept "application/json"
                                                        :content-type "application/json"
                                                        :parameters (list (cons "grant_type" "password")
@@ -160,6 +160,17 @@
                                     :address "127.0.0.1"
                                     :port port)))
   (hunchentoot:start *listener*))
+
+
+(defgeneric to-json (a)
+  (:method ((object hash-table))
+   (with-output-to-string (sink)
+     (yason:encode object sink)))
+
+  (:method ((object list))
+   (with-output-to-string (sink)
+     (yason:encode list sink))))
+
 
 (defun resource-path (path)
   (truename
@@ -261,6 +272,7 @@
     images))
 
 (defun scan-comments ()
+  (authenticate)
   (mapcar (lambda (link)
             (log:info "link")
             (let ((data (drakma:http-request
@@ -272,11 +284,10 @@
                                   (let ((new-comment (gethash "data" comment)))
                                     (unless (comment-find (list (cons "reddit-id" (gethash "id" new-comment))))
                                       (setf (gethash "type" new-comment) "comment")
-                                      (handler-case (doc-put "reddit" (with-output-to-string (sink)
-                                                                        (yason:encode new-comment sink)))
+                                      (handler-case (doc-put "reddit" (to-json new-comment))
                                         (cl-mango:unexpected-http-response (condition)
-                                          (declare (ignore condition))
-                                          (log:info "caught error"))))))
+                                                                           (declare (ignore condition))
+                                                                           (log:info "caught error"))))))
                                 (gethash "children" (gethash "data" listing))))
                       (yason:parse data))))
           (gethash "docs"
@@ -296,34 +307,64 @@
     (when dochash
       (gethash "reddit-id" dochash))))
 
-(defun scan-links ()
-  (authenticate)
 
-  ;; Remove all subreddits.
-  (map 'nil (lambda (sub)
-              (cl-mango:doc-delete "reddit"
-                                   (gethash "_id" sub)
-                                   (gethash "_rev" sub)))
-       (gethash "docs"
+(defun has-subreddit-p (subreddit-name)
+  (subreddit-find (list (cons "display_name" subreddit-name)
+                        (cons "type" "subreddit"))))
+
+(defun get-db-subreddits ()
+  (gethash "docs"
                 (yason:parse
                  (cl-mango:doc-find "reddit" (make-selector
                                               (list
                                                (cons "type" "subreddit"))
                                               :limit 1000)))))
 
-  ;; Read subreddits back from reddit.
-  (map 'nil (lambda (x)
-              (let ((subreddit (json-mop:json-to-clos
-                                (with-output-to-string (sink)
-                                  (yason:encode (gethash "data" x) sink))
-                                'subreddit)))
-                (unless (subreddit-find
-                         (list (cons "display_name" (subreddit-display-name subreddit))
-                               (cons "type" "subreddit")))
-                  (subreddit-put subreddit))))
-       (gethash "children" (gethash "data" (yason:parse
-                                            (reddit-request "/subreddits/mine")))))
+(defun get-reddit-subreddits ()
+  (mapcar (lambda (x)
+            (gethash "data" x))
+          (gethash "children" (gethash "data" (yason:parse
+                                               (reddit-request "/subreddits/mine"))))))
 
+
+
+;;;                  (unless (has-subreddit-p (gethash "display_name" reddit-subreddit))
+;;;                    (setf (gethash "type" reddit-subreddit) "subreddit")
+;;;                    (doc-put "reddit-test" (to-json reddit-subreddit)))
+
+(defun sync-subreddits ()
+  (let ((reddit-subreddits (get-reddit-subreddits))
+        (db-subreddits (get-db-subreddits)))
+;;;     (mapcar (lambda (reddit-subreddit)
+;;;               (unless (has-subreddit-p (gethash "display_name" reddit-subreddit))
+;;;                 (setf (gethash "type" reddit-subreddit) "subreddit")
+;;;                 (doc-put "reddit-test" (to-json reddit-subreddit))))
+;;;             reddit-subreddits)
+
+    (let ((db-subreddit-names (hash-extract "display_name" db-subreddits)))
+      (mapcar (lambda (reddit-subreddit-name)
+                (unless (member reddit-subreddit-name db-subreddit-names)
+                  (format nil "Drop ~a" reddit-subreddit-name)))
+              (hash-extract "display_name" reddit-subreddits)))))
+
+
+(defun hash-extract (name-string list-of-hashes)
+  (mapcar (lambda (x)
+            (gethash name-string x))
+          list-of-hashes))
+
+(defun test ()
+  (let ((reddit-subreddit-names (hash-extract "display_name" (get-reddit-subreddits))))
+    (remove-if #'null
+               (mapcar (lambda (db-subreddit-name)
+                         (unless (member db-subreddit-name reddit-subreddit-names
+                                         :test #'string=)
+                           db-subreddit-name))
+                       (hash-extract "display_name" (get-db-subreddits))))))
+                       
+
+(defun scan-links ()
+  (authenticate)
   (mapc (lambda (subreddit)
           (let ((latest-id (get-latest-post-id-for-subreddit
                             (subreddit-display-name subreddit))))
@@ -343,17 +384,18 @@
                           (setf (gethash "type" new-link) "link")
                           (setf (gethash "written" new-link) (get-universal-time))
                           (setf (gethash "reddit-id" new-link) (gethash "id" new-link))
-                          (handler-case (cl-mango:doc-put "reddit" (with-output-to-string (sink)
-                                                                     (yason:encode new-link sink)))
+                          (handler-case (cl-mango:doc-put "reddit" (to-json new-link))
                             (cl-mango:unexpected-http-response (condition)
                               (declare (ignore condition))
-                              nil)))))
+                              nil)
+                            (error (condition)
+                              (log:info "WTF"))))))
                     links))))
         (subreddit-get-all)))
 
 (defun refresh ()
   (scan-links)
-  ;;(scan-comments)
+  (scan-comments)
   (sleep 180))
 
 (defun start-refresh-thread ()
@@ -361,14 +403,13 @@
                     (loop
                       (refresh)
                       nil))
-                  :name "thresher"))
+                  :name "sup post fetcher/thresher"))
 
 (defun mark-all-as-read ()
   (length
    (mapc (lambda (x)
            (setf (gethash "suphidden" x) 't)
-           (cl-mango:doc-put "reddit" (with-output-to-string (sink)
-                                        (yason:encode x sink))))
+           (cl-mango:doc-put "reddit" (to-json x)))
          (gethash "docs"
                   (yason:parse
                    (doc-find "reddit" (make-selector (list (cons "type" "link")
@@ -401,7 +442,10 @@
                  (:div :class "col-md-6"
                    (:div :class "panel panel-default panel-borders"
                      (:div :class "panel-heading"
-                       (:img :style "max-height:40px;" :class "pull-right,img-responsive" :src (subreddit-icon-img subreddit))
+                       (:img
+                        :style "max-height:40px;"
+                        :class "pull-right,img-responsive"
+                        :src (subreddit-icon-img subreddit))
                        (who:str (subreddit-title subreddit)))
                      (:div :class "panel-body"
                        (:a :href (format nil "https://www.reddit.com~a" (subreddit-url subreddit)) (who:str (subreddit-url subreddit))))))))
@@ -417,66 +461,81 @@
 (defroute links ("/links") ()
   (declare (optimize (debug 3)))
   (with-page (:js ((:script
-                     (who:str
-                      (ps:ps (-> document
-                                 (add-event-listener "DOMContentLoaded"
-                                                     (@ gfy-collection init) nil)))))))
-    (mapcar (lambda (doc-hash)
-              (who:htm
-               (:div :class "row" :id (format nil "wx~a" (gethash "reddit-id" doc-hash))
-                 (:div :class "col-md-7 col-md-offset-3"
-                   (:div :class "panel panel-default panel-borders"
-                     (:div :class "panel-heading"
-                       (:button :id (format nil "hide-~a" (gethash "reddit-id" doc-hash))
-                         :class "btn btn-xs btn-default pull-right" "Close")
-                       (alexandria:when-let ((title (gethash "title" doc-hash)))
-                         (alexandria:if-let ((url (gethash "url" doc-hash)))
-                           (who:htm (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
-                                      :href url (who:str title)))
-                           (who:str title))
-                         (who:htm (:br)))
-                       (:a
-                         :target (format nil "win-~a" (uuid:make-v4-uuid))
-                         :href (format nil "http://localhost:5984/_utils/#database/reddit/~a"
-                                       (gethash "reddit-id" doc-hash))
-                         (who:str (gethash "reddit-id" doc-hash)))
-                       (who:str (format nil "   ~a/~a"
-                                        (gethash "ups" doc-hash)
-                                        (gethash "downs" doc-hash)))
+                    (who:str
+                     (ps:ps (-> document
+                                (add-event-listener "DOMContentLoaded"
+                                                    (@ gfy-collection init) nil)))))))
+    (:div :class "row"
+     (:div :class "col-md-6"
+      (mapcar (lambda (doc-hash)
+                (who:htm
+                 (:div
+                  :class "panel panel-default panel-borders"
+                  :id (format nil "wx~a" (gethash "reddit-id" doc-hash))
+                  (:div :class "panel-heading"
+                   (:button :id (format nil "hide-~a" (gethash "reddit-id" doc-hash))
+                    :class "btn btn-xs btn-default pull-right" "Close")
+                   (alexandria:when-let ((title (gethash "title" doc-hash)))
+                     (alexandria:if-let ((url (gethash "url" doc-hash)))
+                         (who:htm (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
+                                   :href url (who:str title)))
+                       (who:str title))
+                     (who:htm (:br)))
+                   (:a
+                    :target (format nil "win-~a" (uuid:make-v4-uuid))
+                    :href (format nil "http://localhost:5984/_utils/#database/reddit/~a"
+                                  (gethash "reddit-id" doc-hash))
+                    (who:str (gethash "reddit-id" doc-hash)))
+                   (who:str (format nil "   ~a/~a"
+                                    (gethash "ups" doc-hash)
+                                    (gethash "downs" doc-hash)))
 
-                       (:script (who:str
-                                 (ps:ps*
-                                  `(with-document-ready
-                                       (lambda ()
-                                         (-> (sel ,(format nil "#hide-~a" (gethash "reddit-id" doc-hash)))
-                                             (click (lambda (e)
-                                                      (chain (sel ,(format nil "#wx~a" (gethash "reddit-id" doc-hash)))
-                                                             (load ,(format nil
-                                                                            "/link/hide/~a"
-                                                                            (gethash "reddit-id" doc-hash))))
-                                                      (-> (sel ,(format nil "#wx~a" (gethash "reddit-id" doc-hash)))
-                                                          (toggle))
-                                                      (-> e (prevent-default)))))))))))
-                     (:div :class "panel-body"
-                       (alexandria:when-let ((selftext (gethash "selftext" doc-hash)))
-                         (who:str (gethash "selftext" doc-hash)))
-                       (alexandria:when-let ((images (get-images-from-doc-hash doc-hash)))
-                         (map 'nil (lambda (image)
-                                     (alexandria:when-let* ((resolutions (gethash "resolutions" image))
-                                                            (image-url (gethash "url" (car (reverse resolutions)))))
-                                       (who:htm
-                                        (:img :class "img-responsive" :src image-url))))
-                              images))
-                       (who:str (gethash "url" doc-hash))
-                       (:br)
-                       (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
-                         :href (format nil "https://www.reddit.com~a" (gethash "permalink" doc-hash))
-                         (who:str (gethash "subreddit" doc-hash)))))))))
-            (gethash "docs"
-                     (yason:parse
-                      (doc-find "reddit" (make-selector (list (cons "type" "link")
-                                                              (cons "suphidden" (alexandria:alist-hash-table
-                                                                                 (list (cons "$exists" 'yason:false)))))
-                                                        :sort (list (alexandria:alist-hash-table
-                                                                     (list (cons "created" "asc"))))
-                                                        :limit 500)))))))
+                   (:script (who:str
+                             (ps:ps*
+                              `(with-document-ready
+                                (lambda ()
+                                  (-> (sel ,(format nil "#hide-~a" (gethash "reddit-id" doc-hash)))
+                                      (click (lambda (e)
+                                               (chain (sel ,(format nil "#wx~a" (gethash "reddit-id" doc-hash)))
+                                                      (load ,(format nil
+                                                                     "/link/hide/~a"
+                                                                     (gethash "reddit-id" doc-hash))))
+                                               (-> (sel ,(format nil "#wx~a" (gethash "reddit-id" doc-hash)))
+                                                   (toggle))
+                                               (-> e (prevent-default)))))))))))
+                  (:div :class "panel-body"
+                   (alexandria:when-let ((selftext (gethash "selftext" doc-hash)))
+                     (who:str (gethash "selftext" doc-hash)))
+                   (alexandria:when-let ((images (get-images-from-doc-hash doc-hash)))
+                     (map 'nil (lambda (image)
+                                 (alexandria:when-let* ((resolutions (gethash "resolutions" image))
+                                                        (image-url (gethash "url" (car (reverse resolutions)))))
+                                   (who:htm
+                                    (:img :class "img-responsive" :src image-url))))
+                          images))
+                   (who:str (gethash "url" doc-hash))
+                   (:br)
+                   (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
+                    :href (format nil "https://www.reddit.com~a" (gethash "permalink" doc-hash))
+                    (who:str (gethash "subreddit" doc-hash)))))))
+              (gethash "docs"
+                       (yason:parse
+                        (doc-find "reddit" (make-selector (list (cons "type" "link")
+                                                                (cons "suphidden" (alexandria:alist-hash-table
+                                                                                   (list (cons "$exists" 'yason:false)))))
+                                                          :sort (list (alexandria:alist-hash-table
+                                                                       (list (cons "created" "asc"))))
+                                                          :limit 500)))))))))
+
+(defun mark-subreddit-as-read (subreddit)
+  (map 'nil (lambda (doc-hash)
+              (setf (gethash "suphidden" doc-hash) 't)
+              (doc-put "reddit" (to-json doc-hash)))
+       (gethash "docs"
+                (yason:parse
+                 (doc-find "reddit" (make-selector
+                                     (list (cons "subreddit" subreddit)
+                                           (cons "suphidden" (alexandria:alist-hash-table
+                                                              (list (cons "$exists" 'yason:false))))
+                                           (cons "type" "link"))
+                                     :limit 10000))))))
