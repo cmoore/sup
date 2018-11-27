@@ -13,5 +13,6 @@
                :css-lite
                :cl-who
                :split-sequence
-               :cl-mango)
+               :cl-mango
+               :cl-ivy)
   :components ((:file "sup")))
