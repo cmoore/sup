@@ -8,11 +8,15 @@
   :depends-on (:json-mop
                :drakma
                :uuid
+               :html-entities
+               :sb-concurrency
                :easy-routes
                :parenscript
                :css-lite
-               :cl-who
+               :spinneret
+               :spinneret/cl-markdown
                :split-sequence
+               :cl-hash-util
                :cl-mango
                :cl-ivy)
   :components ((:file "sup")))
