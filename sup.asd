@@ -9,7 +9,6 @@
                :drakma
                :uuid
                :html-entities
-               :sb-concurrency
                :easy-routes
                :parenscript
                :css-lite
@@ -18,5 +17,6 @@
                :split-sequence
                :cl-hash-util
                :cl-mango
+               :safe-queue
                :cl-ivy)
   :components ((:file "sup")))

@@ -53,7 +53,7 @@
 (defmethod cl-ivy:make-hash ((object list))
   (cl-ivy:make-hash (to-json object)))
 
-(defvar *comments-box* (sb-concurrency:make-mailbox))
+(defvar *comments-box* (safe-queue:make-mailbox))
 
 (defmacro couch-query (selector &rest args)
   `(gethash "docs" (yason:parse
@@ -250,7 +250,7 @@
              (log:info decoded))
            (log:info "Bailing out."))
        (return-from comments-handle-link))
-     (sleep 2)
+     ;;(sleep 2)
      (dolist (listing (yason:parse data))
        (dolist (comment (gethash "children" (gethash "data" listing)))
          (let* ((new-comment (gethash "data" comment))
@@ -271,8 +271,8 @@
                  (log:info status))))))))))
 
 (defun comments-process-mailbox ()
-  (let ((current-permalink (sb-concurrency:receive-message *comments-box*)))
-    (log:info "linky" current-permalink)
+  (let ((current-permalink (safe-queue:mailbox-receive-message *comments-box*)))
+    ;;(log:info "linky" current-permalink)
     (comments-handle-link current-permalink)))
 
 (defun start-link-processor-thread ()
@@ -281,7 +281,7 @@
                   :name "comment worker"))
 
 (defun send-permalink (permalink)
-  (sb-concurrency:send-message *comments-box* permalink))
+  (safe-queue:mailbox-send-message *comments-box* permalink))
 
 (defun load-comments ()
   (map nil #'send-permalink
@@ -397,6 +397,7 @@
   (multiple-value-bind (id revision hidden)
       (existing-link-info (gethash "id" new-link))
     (unless id
+      (send-permalink (gethash "permalink" new-link))
       (log:info "new link"))
     (unless hidden
       (setf (gethash "type" new-link) "link")
@@ -405,7 +406,7 @@
         (setf (gethash "_id" new-link) id)
         (setf (gethash "_rev" new-link) revision))
       (handler-case (progn
-                      (send-permalink (gethash "permalink" new-link))
+                      ;;(send-permalink (gethash "permalink" new-link))
                       (cl-mango:doc-put "reddit" (to-json new-link)))
         (cl-mango:unexpected-http-response (condition)
           (declare (ignore condition))
@@ -414,19 +415,35 @@
 (defun scan-links ()
   (log:info "LINKS")
   (map nil (lambda (subreddit)
-             (let ((latest-id (get-latest-post-id-for-subreddit
-                               (gethash "display_name" subreddit))))
-               (map nil #'handle-possible-new-link
-                    (hash-extract "data"
-                                  (get-subreddit-links subreddit :latest-id latest-id))))
-             (sleep 2))
-       (couch-query (list (cons "type" "subreddit")))))
+             (unless (ppcre:scan "u_" (gethash "display_name" subreddit))
+               (let ((latest-id (get-latest-post-id-for-subreddit
+                                 (gethash "display_name" subreddit))))
+                 (let ((name (gethash "display_name" subreddit)))
+                   (log:info name))
+                 (map nil #'handle-possible-new-link
+                      (hash-extract "data"
+                                    (get-subreddit-links subreddit :latest-id latest-id))))))
+       (couch-query (list (cons "type" "subreddit"))))
+  (sleep 30))
 
 (defun start-refresh-threads ()
-  ;; (bt:make-thread (lambda ()
-  ;;                   (loop
-  ;;                     (scan-comments)))
-  ;;                 :name "sup comment fetcher")
+  (bt:make-thread (lambda ()
+                    (loop
+                      (map nil
+                           (lambda (link)
+                             (send-permalink (gethash "permalink" link)))
+                           (couch-query
+                            (list (cons "type" "link")
+                                  (cons "suphidden" (alist-hash-table
+                                                     (list (cons "$exists" 'yason:false)))))))
+                      (sleep 30)))
+                  :name "pusher bot")
+  (start-link-processor-thread)
+  (start-link-processor-thread)
+  (start-link-processor-thread)
+  (start-link-processor-thread)
+  (start-link-processor-thread)
+  (start-link-processor-thread)
   (bt:make-thread (lambda ()
                     (loop
                       (authenticate)
@@ -476,16 +493,37 @@
                                  "/r/comment/~a"
                                  (gethash "id" comment))))))))))
 
-(defun display-link (doc-hash &optional original-id)
+(defun display-comment (comment)
+  (let ((body (gethash "body" comment)))
+    (with-html
+      (:p
+        (:span.pull-right
+         ("~a/~a" (gethash "ups" comment)
+                  (gethash "downs" comment)))
+        (:a :href (format nil "https://reddit.com/u/~a" (gethash "author" comment)) (gethash "author" comment))
+        (:br)
+        (:span :style "font-size:14px;"
+          (if-let ((html-body (hash-get comment '("body_html"))))
+            (:raw (html-entities:decode-entities html-body))
+            (with-output-to-string (sink)
+              (ignore-errors (cl-markdown:markdown body :stream *html*)))))
+        (let ((replies (ignore-errors
+                        (gethash "children"
+                                 (gethash "data"
+                                          (gethash "replies" comment))))))
+          (dolist (reply (or replies '()))
+            (:div :style "border-left:1px solid #eee;padding-left:10px;"
+              (display-comment (gethash "data" reply)))))))))
+
+(defun display-link (doc-hash)
   (declare (optimize (debug 3)))
-  (when-let ((crosspost-list (gethash "crosspost_parent_list" doc-hash)))
-    (when (listp crosspost-list)
-      (display-link (car crosspost-list) (gethash "id" doc-hash))
-      (return-from display-link)))
+  ;; (when-let ((crosspost-list (gethash "crosspost_parent_list" doc-hash)))
+  ;;   (when (listp crosspost-list)
+  ;;     (display-link (car crosspost-list) (gethash "id" doc-hash))
+  ;;     (return-from display-link)))
   (with-html
     (let ((comments (couch-query (list (cons "type" "comment")
-                                       (cons "link_id" (format nil "t3_~a" (or original-id
-                                                                               (gethash "id" doc-hash)))))
+                                       (cons "link_id" (format nil "t3_~a" (gethash "id" doc-hash))))
                                  :sort (list (alist-hash-table
                                               (list (cons "ups" "desc"))))
                                  :fields (list "id")))
@@ -522,28 +560,30 @@
                              (-> (sel ,(format nil "#favorite-~a" unique-id))
                                  (click (lambda (e)
                                           (chain (sel ,(format nil "#wx~a" unique-id))
-                                                 (load ,(format nil "/link/favorite/~a" (or original-id
-                                                                                            (gethash "id" doc-hash)))))
+                                                 (load ,(format nil "/link/favorite/~a" (gethash "id" doc-hash))))
                                           (-> (sel ,(format nil "#wx~a" unique-id))
                                               (toggle))
                                           (-> e (prevent-default)))))
                              (-> (sel ,(format nil "#hide-~a" unique-id))
                                  (click (lambda (e)
                                           (chain (sel ,(format nil "#wx~a" unique-id))
-                                                 (load ,(format nil "/link/hide/~a" (or original-id
-                                                                                        (gethash "id" doc-hash)))))
+                                                 (load ,(format nil "/link/hide/~a" (gethash "id" doc-hash))))
                                           (-> (sel ,(format nil "#wx~a" unique-id))
                                               (toggle))
                                           (-> e (prevent-default))))))))))
                   (:div.panel-body
                    (:div.row
                     (:div.col-md-12
-                     (hash-get doc-hash '("selftext"))
+                     (if (hash-get doc-hash '("selftext_html"))
+                         (:raw (html-entities:decode-entities
+                                (hash-get doc-hash '("selftext_html"))))
+                         (hash-get doc-hash '("selftext")))
 
                      (when-let ((secure-media-hash (hash-get doc-hash '("secure_media"))))
                        (when-let ((type (and (hash-table-p secure-media-hash)
                                              (gethash "type" secure-media-hash))))
-                         (cond ((or (string= type "youtube.com")
+                         (cond ((or (string= type "m.imgur.com")
+                                    (string= type "youtube.com")
                                     (string= type "m.youtube.com")
                                     (string= type "streamable.com")
                                     (string= type "gfycat.com"))
@@ -628,26 +668,6 @@
         (setf (gethash "suphidden" the-link) 't)
         (doc-put "reddit" (to-json the-link))))))
 
-(defun display-comment (comment)
-  (let ((body (gethash "body" comment)))
-    (with-html
-      (:p
-        (:span.pull-right
-         ("~a/~a" (gethash "ups" comment)
-                  (gethash "downs" comment)))
-        (:a :href (format nil "https://reddit.com/u/~a" (gethash "author" comment)) (gethash "author" comment))
-        (:br)
-        (:span :style "font-size:14px;"
-          (with-output-to-string (sink)
-            (ignore-errors (cl-markdown:markdown body :stream *html*))))
-        (let ((replies (ignore-errors
-                        (gethash "children"
-                                 (gethash "data"
-                                          (gethash "replies" comment))))))
-          (dolist (reply (or replies '()))
-            (:div :style "border-left:1px solid #eee;padding-left:10px;"
-              (display-comment (gethash "data" reply)))))))))
-
 (defroute render-comment ("/r/comment/:id") ()
   (let ((comments (couch-query (list (cons "type" "comment")
                                      (cons "id" id)))))
@@ -676,7 +696,7 @@
                                                   (list (cons "$exists" 'yason:false)))))
                          :sort (list (alist-hash-table
                                       (list (cons "created" "asc"))))
-                         :limit 100))))
+                         :limit 50))))
 
 (defroute index ("/") ()
   (hunchentoot:redirect "/links"))
@@ -702,3 +722,4 @@
                         (log:info "purged" good)))))
                 ids)))
        (get-db-subreddits)))
+
