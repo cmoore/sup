@@ -55,6 +55,8 @@
 
 (defvar *comments-box* (safe-queue:make-mailbox))
 
+(defparameter *delete-box* (safe-queue:make-mailbox))
+
 (defmacro couch-query (selector &rest args)
   `(gethash "docs" (yason:parse
                     (doc-find "reddit" (make-selector ,selector ,@args)))))
@@ -235,6 +237,7 @@
                   :name "comments vaccum"))
 
 (defun comments-handle-link (permalink)
+  (declare (type string permalink))
   ;; FIX THIS SHITSHOW
   (ignore-errors
    (multiple-value-bind (data status)
@@ -284,13 +287,14 @@
   (safe-queue:mailbox-send-message *comments-box* permalink))
 
 (defun load-comments ()
-  (map nil #'send-permalink
-       (append (couch-query (list (cons "type" "link")
-                                   (cons "suphidden" (alist-hash-table
-                                                      (list (cons "$exists" 'yason:false))))))
-               (couch-query (list (cons "type" "link")
-                                  (cons "favorite" (alist-hash-table
-                                                    (list (cons "$exists" 'yason:true)))))))))
+  (let ((links (append (couch-query (list (cons "type" "link")
+                                          (cons "suphidden" (alist-hash-table
+                                                             (list (cons "$exists" 'yason:false))))))
+                       (couch-query (list (cons "type" "link")
+                                          (cons "favorite" (alist-hash-table
+                                                            (list (cons "$exists" 'yason:true)))))))))
+    (dolist (link links)
+      (send-permalink (gethash "permalink" link)))))
 
 (defun scan-comments ()
   (log:info "comments")
@@ -398,7 +402,8 @@
       (existing-link-info (gethash "id" new-link))
     (unless id
       (send-permalink (gethash "permalink" new-link))
-      (log:info "new link"))
+      ;;(log:info "new link")
+      )
     (unless hidden
       (setf (gethash "type" new-link) "link")
       (setf (gethash "written" new-link) (get-universal-time))
@@ -418,42 +423,82 @@
              (unless (ppcre:scan "u_" (gethash "display_name" subreddit))
                (let ((latest-id (get-latest-post-id-for-subreddit
                                  (gethash "display_name" subreddit))))
-                 (let ((name (gethash "display_name" subreddit)))
-                   (log:info name))
+                 ;; (let ((name (gethash "display_name" subreddit)))
+                 ;;   (log:info name))
                  (map nil #'handle-possible-new-link
                       (hash-extract "data"
                                     (get-subreddit-links subreddit :latest-id latest-id))))))
        (couch-query (list (cons "type" "subreddit"))))
   (sleep 30))
 
-(defun start-refresh-threads ()
+(defun start-scrubber-thread ()
   (bt:make-thread (lambda ()
                     (loop
-                      (map nil
-                           (lambda (link)
-                             (send-permalink (gethash "permalink" link)))
-                           (couch-query
-                            (list (cons "type" "link")
-                                  (cons "suphidden" (alist-hash-table
-                                                     (list (cons "$exists" 'yason:false)))))))
-                      (sleep 30)))
-                  :name "pusher bot")
+                      (let ((link-to-delete (safe-queue:mailbox-receive-message *delete-box*)))
+                        ;; Don't delete the link since its existence is how we know we've
+                        ;; seen it before.
+                        ;; (handler-case
+                        ;;     (doc-delete "reddit" (gethash "_id" x) (gethash "_rev" x))
+                        ;;   (cl-mango:unexpected-http-response (condition)
+                        ;;     (declare (ignore condition))
+                        ;;     nil))
+                        (map nil (lambda (comment-to-delete)
+                                   (handler-case
+                                       (doc-delete "reddit"
+                                                   (gethash "_id" comment-to-delete)
+                                                   (gethash "_rev" comment-to-delete))
+                                     (cl-mango:unexpected-http-response (condition)
+                                       (declare (ignore condition))
+                                       nil)))
+                             (couch-query (list
+                                           (cons "link_id"
+                                                 (format nil "t3_~a" (gethash "id" link-to-delete)))))))))
+                  :name "Scrubber Lang"))
+
+(defun load-scrubber ()
+  (map nil
+       (lambda (killit)
+         (safe-queue:mailbox-send-message *delete-box* killit))
+       (let ((latest-timestamp (hash-get
+                                (car (couch-query (list (cons "created" (alist-hash-table
+                                                                         (list (cons "$exists" 'yason:true))))
+                                                        (cons "link_id" (alist-hash-table
+                                                                         (list (cons "$exists" 'yason:true)))))
+                                                  :fields (list "created")
+                                                  :limit 1))
+                                (list "created"))))
+         (couch-query (list (cons "written" (alist-hash-table
+                                             (list (cons "$lt" (format nil "~a"
+                                                                       (- latest-timestamp
+                                                                          (* 60 60 24))))))))
+                      :limit 10000
+                      :fields (list "id")))))
+
+(defun start-refresh-threads ()
+  (start-scrubber-thread)
+
   (start-link-processor-thread)
   (start-link-processor-thread)
   (start-link-processor-thread)
-  (start-link-processor-thread)
-  (start-link-processor-thread)
-  (start-link-processor-thread)
+
   (bt:make-thread (lambda ()
                     (loop
                       (authenticate)
                       (sync-subreddits)
                       (scan-links)))
-                  :name "sup post fetcher"))
+                  :name "sup post fetcher")
+  (bt:make-thread (lambda ()
+                    (loop
+                      (log:info "FLASH!  AAAAAAA-aaaaaaaaaaaa")
+                      (load-comments)
+                      (sleep (* 15 60))))
+                  :name "comment churner"))
 
 (defun stop-refresh-threads ()
-  (cl-ivy:stop-thread-by-name "sup post fetcher")
-  (cl-ivy:stop-thread-by-name "sup comment fetcher"))
+  (cl-ivy:stop-threads-by-name "comment worker")
+  (cl-ivy:stop-threads-by-name "comment churner")
+  (cl-ivy:stop-threads-by-name "Scrubber Lang")
+  (cl-ivy:stop-thread-by-name "sup post fetcher"))
 
 (defun mark-all-as-read ()
   (let ((num (length
@@ -494,6 +539,7 @@
                                  (gethash "id" comment))))))))))
 
 (defun display-comment (comment)
+  (declare (optimize (speed 3) (debug 0) (safety 1)))
   (let ((body (gethash "body" comment)))
     (with-html
       (:p
@@ -515,22 +561,22 @@
             (:div :style "border-left:1px solid #eee;padding-left:10px;"
               (display-comment (gethash "data" reply)))))))))
 
+(defun show-embedded-html (html)
+  (declare (type string html))
+  (with-html
+    (:raw
+     (html-entities:decode-entities html))))
+
 (defun display-link (doc-hash)
   (declare (optimize (debug 3)))
-  ;; (when-let ((crosspost-list (gethash "crosspost_parent_list" doc-hash)))
-  ;;   (when (listp crosspost-list)
-  ;;     (display-link (car crosspost-list) (gethash "id" doc-hash))
-  ;;     (return-from display-link)))
   (with-html
-    (let ((comments (couch-query (list (cons "type" "comment")
-                                       (cons "link_id" (format nil "t3_~a" (gethash "id" doc-hash))))
-                                 :sort (list (alist-hash-table
-                                              (list (cons "ups" "desc"))))
-                                 :fields (list "id")))
-          (unique-id (format nil "~a" (uuid:make-v4-uuid)))
-          (showed-video nil)
-          (showed-image nil))
-
+    (let ((comments (couch-query
+                     (list (cons "type" "comment")
+                           (cons "link_id" (format nil "t3_~a" (gethash "id" doc-hash))))
+                     :sort (list (alist-hash-table
+                                  (list (cons "ups" "desc"))))
+                     :fields (list "id")))
+          (unique-id (format nil "~a" (uuid:make-v4-uuid))))
       (:div.row :id (format nil "wx~a" unique-id)
                 (:div.col-md-6
                  (:div.panel.panel-default.panel-borders.panel-heading-fullwidth
@@ -574,60 +620,36 @@
                   (:div.panel-body
                    (:div.row
                     (:div.col-md-12
-                     (if (hash-get doc-hash '("selftext_html"))
-                         (:raw (html-entities:decode-entities
-                                (hash-get doc-hash '("selftext_html"))))
-                         (hash-get doc-hash '("selftext")))
 
-                     (when-let ((secure-media-hash (hash-get doc-hash '("secure_media"))))
-                       (when-let ((type (and (hash-table-p secure-media-hash)
-                                             (gethash "type" secure-media-hash))))
-                         (cond ((or (string= type "m.imgur.com")
-                                    (string= type "youtube.com")
-                                    (string= type "m.youtube.com")
-                                    (string= type "streamable.com")
-                                    (string= type "gfycat.com"))
-                                (let ((embed (gethash "oembed" secure-media-hash)))
-                                  (setf showed-video t)
-                                  (:raw
-                                   (html-entities:decode-entities
-                                    (gethash "html" embed))))))))
-                     
-                     ;; Reddit's video walled garden.
-                     (when-let ((fallback-video-url (hash-get doc-hash
-                                                              '("secure_media"
-                                                                "reddit_video"
-                                                                "fallback_url"))))
-                       (setf showed-video t)
-                       (:video :class "img-responsive" :controls 1
-                         (:source :src fallback-video-url)))
-
-                     (unless showed-video
-                       (when-let ((images (hash-get doc-hash '("preview" "images"))))
-                         (map nil
-                              (lambda (image-hash)
-                                (when-let ((mp4-link (hash-get image-hash '("variants" "mp4"))))
-                                  (setf showed-video t)
-                                  (:video :class "img-responsive" :controls 1
-                                    (:source :src mp4-link))
-                                  ("Movie link: ~a" mp4-link))
-                                (when-let ((gif-link (hash-get image-hash '("variants" "gif"))))
-                                  (setf showed-image t)
-                                  (:img.img-responsive :src gif-link))
-                                (when-let ((best-image (car (reverse (gethash "resolutions" image-hash)))))
-                                  (setf showed-image t)
-                                  (:img.img-responsive :src (ppcre:regex-replace-all "&amp;"
-                                                                                     (gethash "url" best-image)
-                                                                                     "&"))))
-                              images))
-                       
-                       (if-let ((fuck (get-imgur-id (hash-get doc-hash '("url")))))
-                         (progn
-                           (:blockquote :class "imgur-embed-pub" :data-id fuck)
-                           (:script :async 1 :src "//s.imgur.com/min/embed.js"))
-                         (unless showed-image
-                           (when-let ((image-url (link-is-image-p (gethash "url" doc-hash))))
-                             (:img.img-responsive :src image-url)))))))
+                     (flet ((is-reddit-video ()
+                              (hash-get doc-hash '("secure_media" "reddit_video" "fallback_url")))
+                            (is-embedded-image ()
+                              (hash-get doc-hash '("preview" "images")))
+                            (has-selftext ()
+                              (hash-get doc-hash '("selftext_html"))))
+                       (cond ((is-reddit-video) (:video :class "img-responsive" :controls 1
+                                                  (:source :src (is-reddit-video))))
+                             ((is-embedded-image) (dolist (image-hash (is-embedded-image))
+                                                    (cond ((hash-get image-hash '("variants"))
+                                                           (let ((has-mp4 (hash-get image-hash
+                                                                                    '("variants"
+                                                                                      "mp4"
+                                                                                      "source"
+                                                                                      "url")))
+                                                                 (has-gif (hash-get image-hash
+                                                                                    '("variants"
+                                                                                      "gif"
+                                                                                      "source"
+                                                                                      "url")))
+                                                                 (has-still-image (hash-get image-hash '("source" "url"))))
+                                                             (cond (has-mp4 (:video :class "img-responsive"
+                                                                                :controls 1
+                                                                                (:source :src (html-entities:decode-entities has-mp4))))
+                                                                   (has-gif (:img :class "img-responsive"
+                                                                              :src (html-entities:decode-entities has-gif)))
+                                                                   (has-still-image (:img :class "img-responsive"
+                                                                                      :src (html-entities:decode-entities has-still-image)))))))))
+                             ((has-selftext) (:raw (html-entities:decode-entities (has-selftext))))))))
                    (:div.row
                     (:div.col-md-12
                      (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
@@ -636,20 +658,24 @@
                        "db"))))))
                 (:div.col-md-6
                  (when (< 0 (length comments))
-                   (:div.panel.panel-default.panel-borders :style "border:1px solid rgb(7,7,7);"
-                                                           (:div.panel-body
-                                                            (dolist (comment comments)
-                                                              (:div :id (format nil "comment-~a"
-                                                                                (gethash "id" comment)))
-                                                              (%ps-load-comments comment (gethash "id" comment)))))))))))
+                   (:div.panel.panel-default.panel-borders
+                    :style "border:1px solid rgb(7,7,7);"
+                    (:div.panel-body
+                     (dolist (comment comments)
+                       (:div :id (format nil "comment-~a"
+                                         (gethash "id" comment)))
+                       (%ps-load-comments comment (gethash "id" comment)))))))))))
 
 (defroute hide-link ("/link/hide/:id") ()
-  (let ((the-link (car (couch-query (list (cons "id" id)
-                                          (cons "type" "link"))
-                                    :limit 1))))
-    (when the-link
-      (setf (gethash "suphidden" the-link) t)
-      (doc-put "reddit" (to-json the-link))))
+  (when-let ((the-link (couch-query (list (cons "id" id)
+                                     (cons "type" "link"))
+                               :limit 1)))
+    (map nil (lambda (link)
+               (setf (gethash "suphidden" link) t)
+               (doc-put "reddit" (to-json link)))
+         (remove-if-not (lambda (x)
+                          (string= "link" (hash-get x (list "type"))))
+                        the-link)))
   "ok")
 
 (defroute favorite-link ("/link/favorite/:id") ()
@@ -669,6 +695,7 @@
         (doc-put "reddit" (to-json the-link))))))
 
 (defroute render-comment ("/r/comment/:id") ()
+  (declare (optimize (speed 3) (debug 0) (safety 1)))
   (let ((comments (couch-query (list (cons "type" "comment")
                                      (cons "id" id)))))
     (with-html-string
@@ -690,13 +717,13 @@
         (:a :class "btn btn-default btn-xs"
           :style "position:fixed;top:0;left:0;"
           :href "/favorites" "Favorites")))
-    (mapcar #'display-link
-            (couch-query (list (cons "type" "link")
-                               (cons "suphidden" (alist-hash-table
-                                                  (list (cons "$exists" 'yason:false)))))
-                         :sort (list (alist-hash-table
-                                      (list (cons "created" "asc"))))
-                         :limit 50))))
+    (map nil #'display-link
+         (couch-query (list (cons "type" "link")
+                            (cons "suphidden" (alist-hash-table
+                                               (list (cons "$exists" 'yason:false)))))
+                      :sort (list (alist-hash-table
+                                   (list (cons "created" "asc"))))
+                      :limit 100))))
 
 (defroute index ("/") ()
   (hunchentoot:redirect "/links"))
