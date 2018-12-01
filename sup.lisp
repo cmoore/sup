@@ -93,7 +93,7 @@
 (defun start-server (&key (port 8086))
   (unless *listener*
     (setf *listener* (make-instance 'easy-routes:easy-routes-acceptor
-                                    :address "127.0.0.1"
+                                    ;;:address "127.0.0.1"
                                     :port port)))
   (hunchentoot:start *listener*))
 
@@ -583,12 +583,15 @@
                   :style "border:1px solid rgb(7,7,7);"
                   (:div.panel-heading
                    (:div.tools
+                    (:div.icon
+                     (:a :href (format nil "/link/~a" (hash-get doc-hash '("id")))
+                       (:i :class "s7-link")))
                     (:div.icon :id (format nil "favorite-~a" unique-id)
                                (:span.s7-download))
                     (:div.icon :id (format nil "hide-~a" unique-id)
                                (:span.s7-close-circle)))
                    (:div.pull-right
-                    ("   ~a/~a" (gethash "ups" doc-hash)
+                    ("~a/~a   " (gethash "ups" doc-hash)
                                 (gethash "downs" doc-hash)))
                    (when-let ((title (gethash "title" doc-hash)))
                      (if-let ((url (gethash "url" doc-hash)))
@@ -626,9 +629,20 @@
                             (is-embedded-image ()
                               (hash-get doc-hash '("preview" "images")))
                             (has-selftext ()
-                              (hash-get doc-hash '("selftext_html"))))
+                              (hash-get doc-hash '("selftext_html")))
+                            (has-crosspost-parent-media ()
+                              (let ((crosspost-parent-list (hash-get doc-hash '("crosspost_parent_list"))))
+                                (when (listp crosspost-parent-list)
+                                  (hash-get (car crosspost-parent-list)
+                                            '("preview" "reddit_video_preview" "fallback_url"))))))
                        (cond ((is-reddit-video) (:video :class "img-responsive" :controls 1
                                                   (:source :src (is-reddit-video))))
+                             ;; Matches if the post is a crosspost and the original
+                             ;; has a video hosted at reddit
+                             ((has-crosspost-parent-media) (progn
+                                                             (log:info "Yes!")
+                                                             (:video :class "img-responsive" :controls 1
+                                                               (:source :src (has-crosspost-parent-media)))))
                              ((is-embedded-image) (dolist (image-hash (is-embedded-image))
                                                     (cond ((hash-get image-hash '("variants"))
                                                            (let ((has-mp4 (hash-get image-hash
@@ -643,8 +657,8 @@
                                                                                       "url")))
                                                                  (has-still-image (hash-get image-hash '("source" "url"))))
                                                              (cond (has-mp4 (:video :class "img-responsive"
-                                                                                :controls 1
-                                                                                (:source :src (html-entities:decode-entities has-mp4))))
+                                                                              :controls 1
+                                                                              (:source :src (html-entities:decode-entities has-mp4))))
                                                                    (has-gif (:img :class "img-responsive"
                                                                               :src (html-entities:decode-entities has-gif)))
                                                                    (has-still-image (:img :class "img-responsive"
@@ -750,3 +764,8 @@
                 ids)))
        (get-db-subreddits)))
 
+(defroute display-single-link ("/link/:id") ()
+  (let ((link (car (couch-query (list (cons "type" "link")
+                                      (cons "id" id))))))
+    (with-page ()
+      (display-link link))))
