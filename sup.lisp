@@ -22,7 +22,7 @@
   (setf cl-mango:*port* 5984)
   (setf cl-mango:*scheme* :http)
   (setf cl-mango:*username* "admin")
-  (setf cl-mango:*password* "h4r01d")
+  (setf cl-mango:*password* "3113nsburg")
 
   (defparameter *client-id* "NgPcSAMcznk3aQ")
   (defparameter *client-secret* "nZZdcddz-BbYEVwpwkhiGOjzRoQ"))
@@ -200,44 +200,9 @@
               (images (gethash "images" preview)))
     images))
 
-(defun delete-links ()
-  (let ((num-links (length
-                    (mapcar (lambda (link)
-                              (doc-delete "reddit" (gethash "_id" link) (gethash "_rev" link)))
-                            (couch-query (list (cons "type" "link"))
-                                         :fields (list "_id" "_rev")
-                                         :limit 1000)))))
-    (unless (equal 0 num-links)
-      (log:info "link step")
-      (delete-links))))
-
-(defun delete-comments ()
-  (let ((num-comments (length
-                       (mapcar (lambda (comment)
-                                 (handler-case
-                                     (doc-delete "reddit" (gethash "_id" comment) (gethash "_rev" comment))
-                                   (cl-mango:unexpected-http-response (condition)
-                                     (declare (ignore condition))
-                                     nil)))
-                               (couch-query (list (cons "type" "comment"))
-                                            :fields (list "_id" "_rev")
-                                            :limit 1000)))))
-    (unless (equal 0 num-comments)
-      (log:info "comment step")
-      (delete-comments))))
-
-(defun delete-all-links-and-comments ()
-  (bt:make-thread (lambda ()
-                    (delete-links)
-                    (log:info "Links deleted."))
-                  :name "link vaccum")
-  (bt:make-thread (lambda ()
-                    (delete-comments)
-                    (log:info "Comments deleted"))
-                  :name "comments vaccum"))
-
 (defun comments-handle-link (permalink)
-  (declare (type string permalink))
+  (declare (type string permalink)
+           (optimize (debug 0) (speed 3) (safety 1)))
   ;; FIX THIS SHITSHOW
   (ignore-errors
    (multiple-value-bind (data status)
@@ -274,9 +239,8 @@
                  (log:info status))))))))))
 
 (defun comments-process-mailbox ()
-  (let ((current-permalink (safe-queue:mailbox-receive-message *comments-box*)))
-    ;;(log:info "linky" current-permalink)
-    (comments-handle-link current-permalink)))
+  (comments-handle-link
+   (safe-queue:mailbox-receive-message *comments-box*)))
 
 (defun start-link-processor-thread ()
   (bt:make-thread (lambda ()
@@ -298,15 +262,17 @@
 
 (defun scan-comments ()
   (log:info "comments")
-  ;; (map 'nil #'comments-handle-link
-  ;;      (couch-query (list (cons "type" "link")
-  ;;                         (cons "suphidden" (alist-hash-table
-  ;;                                            (list (cons "$exists" 'yason:false)))))
-  ;;                   :fields (list "permalink")
-  ;;                   :limit 10000))
+  (map 'nil #'comments-handle-link
+       (hash-extract "permalink"
+                     (couch-query (list (cons "type" "link")
+                                        (cons "suphidden" (alist-hash-table
+                                                           (list (cons "$exists" 'yason:false)))))
+                                  :fields (list "permalink")
+                                  :limit 10000)))
   (mapcar #'comments-handle-link
-          (couch-query (list (cons "type" "link")
-                             (cons "favorite" 'yason:true))))
+          (hash-extract "permalink"
+                        (couch-query (list (cons "type" "link")
+                                           (cons "favorite" 'yason:true)))))
   (sleep 30))
 
 (defun link-is-image-p (link)
@@ -475,10 +441,8 @@
                       :fields (list "id")))))
 
 (defun start-refresh-threads ()
-  (start-scrubber-thread)
+  ;;(start-scrubber-thread)
 
-  (start-link-processor-thread)
-  (start-link-processor-thread)
   (start-link-processor-thread)
 
   (bt:make-thread (lambda ()
@@ -493,6 +457,13 @@
                       (load-comments)
                       (sleep (* 15 60))))
                   :name "comment churner"))
+
+(defun refresh-data ()
+  (authenticate)
+  (sync-subreddits)
+  (scan-links)
+  (scan-comments)
+  (sleep 30))
 
 (defun stop-refresh-threads ()
   (cl-ivy:stop-threads-by-name "comment worker")
@@ -539,7 +510,6 @@
                                  (gethash "id" comment))))))))))
 
 (defun display-comment (comment)
-  (declare (optimize (speed 3) (debug 0) (safety 1)))
   (let ((body (gethash "body" comment)))
     (with-html
       (:p
@@ -567,16 +537,17 @@
     (:raw
      (html-entities:decode-entities html))))
 
-(defun display-link (doc-hash)
-  (declare (optimize (debug 3)))
-  (with-html
-    (let ((comments (couch-query
+(defroute show-comments ("/comments/:id") ()
+  (let ((comments (couch-query
                      (list (cons "type" "comment")
-                           (cons "link_id" (format nil "t3_~a" (gethash "id" doc-hash))))
+                           (cons "link_id" (format nil "t3_~a" id)))
                      :sort (list (alist-hash-table
-                                  (list (cons "ups" "desc"))))
-                     :fields (list "id")))
-          (unique-id (format nil "~a" (uuid:make-v4-uuid))))
+                                  (list (cons "ups" "desc")))))))
+    (with-html-string (map 'nil #'display-comment comments))))
+
+(defun display-link (doc-hash)
+  (with-html
+    (let ((unique-id (format nil "~a" (uuid:make-v4-uuid))))
       (:div.row :id (format nil "wx~a" unique-id)
                 (:div.col-md-6
                  (:div.panel.panel-default.panel-borders.panel-heading-fullwidth
@@ -624,61 +595,65 @@
                    (:div.row
                     (:div.col-md-12
 
-                     (flet ((is-reddit-video ()
-                              (hash-get doc-hash '("secure_media" "reddit_video" "fallback_url")))
-                            (is-embedded-image ()
-                              (hash-get doc-hash '("preview" "images")))
-                            (has-selftext ()
-                              (hash-get doc-hash '("selftext_html")))
-                            (has-crosspost-parent-media ()
-                              (let ((crosspost-parent-list (hash-get doc-hash '("crosspost_parent_list"))))
-                                (when (listp crosspost-parent-list)
-                                  (hash-get (car crosspost-parent-list)
-                                            '("preview" "reddit_video_preview" "fallback_url"))))))
-                       (cond ((is-reddit-video) (:video :class "img-responsive" :controls 1
-                                                  (:source :src (is-reddit-video))))
+                     (let ((crossposted-reddit-video (hash-get doc-hash '("crosspost_parent_list" 0 "secure_media" "reddit_video" "fallback_url")))
+                           (reddit-preview-of-imgur-gif (hash-get doc-hash '("preview" "reddit_video_preview" "fallback_url")))
+                           (is-reddit-video (hash-get doc-hash '("secure_media" "reddit_video" "fallback_url")))
+                           (is-embedded-image (hash-get doc-hash '("preview" "images")))
+                           (has-selftext (hash-get doc-hash '("selftext_html")))
+                           (has-oembed-media (hash-get doc-hash '("secure_media" "oembed" "html")))
+                           (has-crosspost-parent-media (let ((crosspost-parent-list (hash-get doc-hash '("crosspost_parent_list"))))
+                                                         (when (listp crosspost-parent-list)
+                                                           (hash-get (car crosspost-parent-list)
+                                                                     '("preview" "reddit_video_preview" "fallback_url"))))))
+                       (cond (crossposted-reddit-video (:video :class "img-responsive" :controls 1
+                                                         (:source :src crossposted-reddit-video)))
+                             (reddit-preview-of-imgur-gif (:video :class "img-responsive" :controls 1
+                                                                                          (:source :src reddit-preview-of-imgur-gif)))
+                             (has-oembed-media (:raw (html-entities:decode-entities
+                                                         has-oembed-media)))
+                             (is-reddit-video (:video :class "img-responsive" :controls 1
+                                                (:source :src is-reddit-video)))
                              ;; Matches if the post is a crosspost and the original
                              ;; has a video hosted at reddit
-                             ((has-crosspost-parent-media) (progn
-                                                             (log:info "Yes!")
-                                                             (:video :class "img-responsive" :controls 1
-                                                               (:source :src (has-crosspost-parent-media)))))
-                             ((is-embedded-image) (dolist (image-hash (is-embedded-image))
-                                                    (cond ((hash-get image-hash '("variants"))
-                                                           (let ((has-mp4 (hash-get image-hash
-                                                                                    '("variants"
-                                                                                      "mp4"
-                                                                                      "source"
-                                                                                      "url")))
-                                                                 (has-gif (hash-get image-hash
-                                                                                    '("variants"
-                                                                                      "gif"
-                                                                                      "source"
-                                                                                      "url")))
-                                                                 (has-still-image (hash-get image-hash '("source" "url"))))
-                                                             (cond (has-mp4 (:video :class "img-responsive"
-                                                                              :controls 1
-                                                                              (:source :src (html-entities:decode-entities has-mp4))))
-                                                                   (has-gif (:img :class "img-responsive"
-                                                                              :src (html-entities:decode-entities has-gif)))
-                                                                   (has-still-image (:img :class "img-responsive"
-                                                                                      :src (html-entities:decode-entities has-still-image)))))))))
-                             ((has-selftext) (:raw (html-entities:decode-entities (has-selftext))))))))
+                             (has-crosspost-parent-media (progn
+                                                           (log:info "Yes!")
+                                                           (:video :class "img-responsive" :controls 1
+                                                             (:source :src has-crosspost-parent-media))))
+                             (is-embedded-image (dolist (image-hash is-embedded-image)
+                                                  (cond ((hash-get image-hash '("variants"))
+                                                         (let ((has-mp4 (hash-get image-hash
+                                                                                  '("variants"
+                                                                                    "mp4"
+                                                                                    "source"
+                                                                                    "url")))
+                                                               (has-gif (hash-get image-hash
+                                                                                  '("variants"
+                                                                                    "gif"
+                                                                                    "source"
+                                                                                    "url")))
+                                                               (has-still-image (hash-get image-hash '("source" "url"))))
+                                                           (cond (has-mp4 (:video :class "img-responsive"
+                                                                            :controls 1
+                                                                            (:source :src (html-entities:decode-entities has-mp4))))
+                                                                 (has-gif (:img :class "img-responsive"
+                                                                            :src (html-entities:decode-entities has-gif)))
+                                                                 (has-still-image (:img :class "img-responsive"
+                                                                                    :src (html-entities:decode-entities has-still-image)))))))))
+                             (has-selftext (:raw (html-entities:decode-entities has-selftext)))))))
                    (:div.row
                     (:div.col-md-12
                      (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
-                       :href (format nil "http://localhost:5984/_utils/#database/reddit/~a"
+                       :href (format nil "https://grid.ivy.io/_utils/#database/reddit/~a"
                                      (gethash "_id" doc-hash))
                        "db"))))))
                 (:div.col-md-6
-                 (when (< 0 (length comments))
-                   (:div.panel.panel-default.panel-borders
-                    :style "border:1px solid rgb(7,7,7);"
-                    (:div.panel-body
-                     (dolist (comment comments)
-                       (:div :id (format nil "comment-~a"
-                                         (gethash "id" comment)))
-                       (%ps-load-comments comment (gethash "id" comment)))))))))))
+                 (:div.panel.panel-default.panel-borders
+                  :style "border:1px solid rgb(7,7,7);"
+                  (:div.panel-body :id (format nil "comments-~a" (gethash "id" doc-hash)))
+                  (:script
+                    (ps:ps* `(with-document-ready (lambda ()
+                                                    (-> (sel ,(format nil "#comments-~a" (gethash "id" doc-hash)))
+                                                        (load ,(format nil "/comments/~a" (gethash "id" doc-hash))))))))))))))
 
 (defroute hide-link ("/link/hide/:id") ()
   (when-let ((the-link (couch-query (list (cons "id" id)
@@ -724,7 +699,6 @@
                                       (list (cons "created" "desc"))))))))
 
 (defroute links ("/links") ()
-  (declare (optimize (debug 0) (speed 3) (safety 1)))
   (with-page ()
     (:div :class "row"
       (:div :class "col-md-6"
@@ -737,7 +711,7 @@
                                                (list (cons "$exists" 'yason:false)))))
                       :sort (list (alist-hash-table
                                    (list (cons "created" "asc"))))
-                      :limit 100))))
+                      :limit 500))))
 
 (defroute index ("/") ()
   (hunchentoot:redirect "/links"))
