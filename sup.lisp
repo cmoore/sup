@@ -22,7 +22,7 @@
   (setf cl-mango:*port* 5984)
   (setf cl-mango:*scheme* :http)
   (setf cl-mango:*username* "admin")
-  (setf cl-mango:*password* "3113nsburg")
+  (setf cl-mango:*password* "h4r01d")
 
   (defparameter *client-id* "NgPcSAMcznk3aQ")
   (defparameter *client-secret* "nZZdcddz-BbYEVwpwkhiGOjzRoQ"))
@@ -52,10 +52,6 @@
 
 (defmethod cl-ivy:make-hash ((object list))
   (cl-ivy:make-hash (to-json object)))
-
-(defvar *comments-box* (safe-queue:make-mailbox))
-
-(defparameter *delete-box* (safe-queue:make-mailbox))
 
 (defmacro couch-query (selector &rest args)
   `(gethash "docs" (yason:parse
@@ -87,6 +83,14 @@
                                             (cons "Authorization" (format nil
                                                                           "bearer ~a"
                                                                           (access-token-access-token *reddit-user*))))))
+
+(defun make-id (doc-hash)
+  (declare (type hash-table doc-hash))
+  (let ((the-reddit-id (gethash "id" doc-hash))
+        (the-type (gethash "type" doc-hash)))
+    (assert (and (stringp the-reddit-id)
+                 (stringp the-type)))
+    (format nil "~a:~a" the-reddit-id the-type)))
 
 (defparameter *listener* nil)
 
@@ -201,8 +205,7 @@
     images))
 
 (defun comments-handle-link (permalink)
-  (declare (type string permalink)
-           (optimize (debug 0) (speed 3) (safety 1)))
+  (declare (type string permalink))
   ;; FIX THIS SHITSHOW
   (ignore-errors
    (multiple-value-bind (data status)
@@ -227,38 +230,18 @@
                                                    (cons "type" "comment"))
                                              :limit 1
                                              :fields (list "_id" "_rev" "type")))))
-           (when comment-in-db
-             (setf (gethash "_id" new-comment) (gethash "_id" comment-in-db))
-             (setf (gethash "_rev" new-comment) (gethash "_rev" comment-in-db)))
            (setf (gethash "type" new-comment) "comment")
+           (if comment-in-db
+               (progn
+                 (setf (gethash "_id" new-comment) (gethash "_id" comment-in-db))
+                 (setf (gethash "_rev" new-comment) (gethash "_rev" comment-in-db)))
+               (setf (gethash "_id" new-comment) (make-id new-comment)))
            ;;(log:info "writing comment")
-           (handler-case (progn
-                           (doc-put "reddit" (to-json new-comment)))
+           (handler-case
+               (doc-put "reddit" (to-json new-comment))
              (cl-mango:unexpected-http-response (condition)
                (let ((status (cl-mango::status-body condition)))
                  (log:info status))))))))))
-
-(defun comments-process-mailbox ()
-  (comments-handle-link
-   (safe-queue:mailbox-receive-message *comments-box*)))
-
-(defun start-link-processor-thread ()
-  (bt:make-thread (lambda ()
-                    (loop (comments-process-mailbox)))
-                  :name "comment worker"))
-
-(defun send-permalink (permalink)
-  (safe-queue:mailbox-send-message *comments-box* permalink))
-
-(defun load-comments ()
-  (let ((links (append (couch-query (list (cons "type" "link")
-                                          (cons "suphidden" (alist-hash-table
-                                                             (list (cons "$exists" 'yason:false))))))
-                       (couch-query (list (cons "type" "link")
-                                          (cons "favorite" (alist-hash-table
-                                                            (list (cons "$exists" 'yason:true)))))))))
-    (dolist (link links)
-      (send-permalink (gethash "permalink" link)))))
 
 (defun scan-comments ()
   (log:info "comments")
@@ -272,8 +255,7 @@
   (mapcar #'comments-handle-link
           (hash-extract "permalink"
                         (couch-query (list (cons "type" "link")
-                                           (cons "favorite" 'yason:true)))))
-  (sleep 30))
+                                           (cons "favorite" 'yason:true))))))
 
 (defun link-is-image-p (link)
   (cond ((ppcre:scan ".jpg$|.png$|.gif$" link) link)
@@ -284,7 +266,8 @@
   (handler-case (let ((dochash (car (couch-query (list (cons "subreddit" subreddit))
                                                  :limit 1
                                                  :sort (list (alist-hash-table
-                                                              (list (cons "created" "desc"))))))))
+                                                              (list (cons "created" "desc"))))
+                                                 :fields (list "id")))))
                   (when dochash
                     (gethash "id" dochash)))
     (cl-mango:unexpected-http-response (condition)
@@ -337,8 +320,9 @@
             (gethash name-string x))
           list-of-hashes))
 
-(defun existing-link-info (new-link)
-  (let ((link-info (car (couch-query (list (cons "id" new-link))
+(defun existing-link-info (link-id)
+  (let ((link-info (car (couch-query (list (cons "id" (format nil "~a:~a" link-id "link"))
+                                           (cons "type" "link"))
                                      :fields (list "_id" "_rev" "suphidden")))))
     (when (typep link-info 'hash-table)
       (values (gethash "_id" link-info)
@@ -367,83 +351,33 @@
   (multiple-value-bind (id revision hidden)
       (existing-link-info (gethash "id" new-link))
     (unless id
-      (send-permalink (gethash "permalink" new-link))
-      ;;(log:info "new link")
-      )
+      (send-permalink (gethash "permalink" new-link)))
     (unless hidden
       (setf (gethash "type" new-link) "link")
       (setf (gethash "written" new-link) (get-universal-time))
-      (when revision
-        (setf (gethash "_id" new-link) id)
-        (setf (gethash "_rev" new-link) revision))
-      (handler-case (progn
-                      ;;(send-permalink (gethash "permalink" new-link))
-                      (cl-mango:doc-put "reddit" (to-json new-link)))
+      (if revision
+          (progn
+            (setf (gethash "_id" new-link) id)
+            (setf (gethash "_rev" new-link) revision))
+          (setf (gethash "_id" new-link) (make-id new-link)))
+      (handler-case
+          (cl-mango:doc-put "reddit" (to-json new-link))
         (cl-mango:unexpected-http-response (condition)
           (declare (ignore condition))
           nil)))))
 
 (defun scan-links ()
-  (log:info "LINKS")
+  (log:info "links")
   (map nil (lambda (subreddit)
              (unless (ppcre:scan "u_" (gethash "display_name" subreddit))
                (let ((latest-id (get-latest-post-id-for-subreddit
                                  (gethash "display_name" subreddit))))
-                 ;; (let ((name (gethash "display_name" subreddit)))
-                 ;;   (log:info name))
                  (map nil #'handle-possible-new-link
                       (hash-extract "data"
-                                    (get-subreddit-links subreddit :latest-id latest-id))))))
-       (couch-query (list (cons "type" "subreddit"))))
-  (sleep 30))
-
-(defun start-scrubber-thread ()
-  (bt:make-thread (lambda ()
-                    (loop
-                      (let ((link-to-delete (safe-queue:mailbox-receive-message *delete-box*)))
-                        ;; Don't delete the link since its existence is how we know we've
-                        ;; seen it before.
-                        ;; (handler-case
-                        ;;     (doc-delete "reddit" (gethash "_id" x) (gethash "_rev" x))
-                        ;;   (cl-mango:unexpected-http-response (condition)
-                        ;;     (declare (ignore condition))
-                        ;;     nil))
-                        (map nil (lambda (comment-to-delete)
-                                   (handler-case
-                                       (doc-delete "reddit"
-                                                   (gethash "_id" comment-to-delete)
-                                                   (gethash "_rev" comment-to-delete))
-                                     (cl-mango:unexpected-http-response (condition)
-                                       (declare (ignore condition))
-                                       nil)))
-                             (couch-query (list
-                                           (cons "link_id"
-                                                 (format nil "t3_~a" (gethash "id" link-to-delete)))))))))
-                  :name "Scrubber Lang"))
-
-(defun load-scrubber ()
-  (map nil
-       (lambda (killit)
-         (safe-queue:mailbox-send-message *delete-box* killit))
-       (let ((latest-timestamp (hash-get
-                                (car (couch-query (list (cons "created" (alist-hash-table
-                                                                         (list (cons "$exists" 'yason:true))))
-                                                        (cons "link_id" (alist-hash-table
-                                                                         (list (cons "$exists" 'yason:true)))))
-                                                  :fields (list "created")
-                                                  :limit 1))
-                                (list "created"))))
-         (couch-query (list (cons "written" (alist-hash-table
-                                             (list (cons "$lt" (format nil "~a"
-                                                                       (- latest-timestamp
-                                                                          (* 60 60 24))))))))
-                      :limit 10000
-                      :fields (list "id")))))
+                                    (get-subreddit-links subreddit :latest-id (or latest-id 0)))))))
+       (couch-query (list (cons "type" "subreddit")))))
 
 (defun start-refresh-threads ()
-  ;;(start-scrubber-thread)
-
-  (start-link-processor-thread)
 
   (bt:make-thread (lambda ()
                     (loop
@@ -453,37 +387,13 @@
                   :name "sup post fetcher")
   (bt:make-thread (lambda ()
                     (loop
-                      (log:info "FLASH!  AAAAAAA-aaaaaaaaaaaa")
-                      (load-comments)
-                      (sleep (* 15 60))))
-                  :name "comment churner"))
-
-(defun refresh-data ()
-  (authenticate)
-  (sync-subreddits)
-  (scan-links)
-  (scan-comments)
-  (sleep 30))
+                      (scan-comments)
+                      (sleep (* 5 60))))
+                  :name "sup comment fetcher"))
 
 (defun stop-refresh-threads ()
-  (cl-ivy:stop-threads-by-name "comment worker")
-  (cl-ivy:stop-threads-by-name "comment churner")
-  (cl-ivy:stop-threads-by-name "Scrubber Lang")
+  (cl-ivy:stop-threads-by-name "sup comment fetcher")
   (cl-ivy:stop-thread-by-name "sup post fetcher"))
-
-(defun mark-all-as-read ()
-  (let ((num (length
-              (mapc (lambda (x)
-                      (setf (gethash "suphidden" x) 't)
-                      (cl-mango:doc-put "reddit" (to-json x)))
-                    (couch-query (list (cons "type" "link")
-                                       (cons "suphidden" (alist-hash-table
-                                                          (list (cons "$exists" 'yason:false)))))
-                                 :sort (list (alist-hash-table
-                                              (list (cons "created" "desc"))))
-                                 :limit 1000)))))
-    (when (< 0 num)
-      (mark-all-as-read))))
 
 (defun mark-subreddit-as-read (subreddit)
   (let ((posts (couch-query (list (cons "subreddit" subreddit)
@@ -516,6 +426,8 @@
         (:span.pull-right
          ("~a/~a" (gethash "ups" comment)
                   (gethash "downs" comment)))
+        ("~a" (gethash "_id" comment))
+        (:br)
         (:a :href (format nil "https://reddit.com/u/~a" (gethash "author" comment)) (gethash "author" comment))
         (:br)
         (:span :style "font-size:14px;"
@@ -527,7 +439,7 @@
                         (gethash "children"
                                  (gethash "data"
                                           (gethash "replies" comment))))))
-          (dolist (reply (or replies '()))
+          (dolist (reply (or replies nil))
             (:div :style "border-left:1px solid #eee;padding-left:10px;"
               (display-comment (gethash "data" reply)))))))))
 
@@ -564,6 +476,8 @@
                    (:div.pull-right
                     ("~a/~a   " (gethash "ups" doc-hash)
                                 (gethash "downs" doc-hash)))
+                   ("~a" (gethash "_id" doc-hash))
+                   (:br)
                    (when-let ((title (gethash "title" doc-hash)))
                      (if-let ((url (gethash "url" doc-hash)))
                        (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
@@ -643,7 +557,7 @@
                    (:div.row
                     (:div.col-md-12
                      (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
-                       :href (format nil "https://grid.ivy.io/_utils/#database/reddit/~a"
+                       :href (format nil "http://localhost:5984/_utils/#database/reddit/~a"
                                      (gethash "_id" doc-hash))
                        "db"))))))
                 (:div.col-md-6
@@ -657,8 +571,8 @@
 
 (defroute hide-link ("/link/hide/:id") ()
   (when-let ((the-link (couch-query (list (cons "id" id)
-                                     (cons "type" "link"))
-                               :limit 1)))
+                                          (cons "type" "link"))
+                                    :limit 1)))
     (map nil (lambda (link)
                (setf (gethash "suphidden" link) t)
                (doc-put "reddit" (to-json link)))
@@ -711,7 +625,7 @@
                                                (list (cons "$exists" 'yason:false)))))
                       :sort (list (alist-hash-table
                                    (list (cons "created" "asc"))))
-                      :limit 500))))
+                      :limit 100))))
 
 (defroute index ("/") ()
   (hunchentoot:redirect "/links"))
@@ -743,3 +657,15 @@
                                       (cons "id" id))))))
     (with-page ()
       (display-link link))))
+
+(defun scan-this-shit ()
+  (let ((rows (couch-query (list (cons "type" "comment"))
+                    :limit 100000
+                    :fields (list "_id"))))
+    (dolist (row rows)
+      (let* ((id (gethash "_id" row))
+             (split-version (ppcre:split ":" id)))
+        (unless (or (string= (cadr split-version) "link")
+                    (string= (cadr split-version) "comment"))
+          (log:info id))))
+    (length rows)))
