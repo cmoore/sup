@@ -22,7 +22,7 @@
   (setf cl-mango:*port* 5984)
   (setf cl-mango:*scheme* :http)
   (setf cl-mango:*username* "admin")
-  (setf cl-mango:*password* "h4r01d")
+  (setf cl-mango:*password* "3113nsburg")
 
   (defparameter *client-id* "NgPcSAMcznk3aQ")
   (defparameter *client-secret* "nZZdcddz-BbYEVwpwkhiGOjzRoQ"))
