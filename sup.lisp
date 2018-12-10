@@ -1,4 +1,4 @@
-;;; -*- mode: Lisp; Syntax: COMMON-LISP; Package: CL-MANGO; Base: 10 eval: (hs-hide-all) -*-
+;;; -*- mode: Lisp; Syntax: common-lisp; Package: sup; Base: 10 eval: (hs-hide-all) -*-
 
 (defpackage :sup
   (:use #:cl
@@ -345,13 +345,15 @@
                        (usocket:timeout-error (condition)
                          (declare (ignore condition))
                          (log:info "Timeout error.  Restarting.")
+                         (get-subreddit-links subreddit :latest-id latest-id))
+                       (error (condition)
+                         (log:info "Some sort of error:" condition)
+                         (log:info "Restarting.")
                          (get-subreddit-links subreddit :latest-id latest-id)))))))
 
 (defun handle-possible-new-link (new-link)
   (multiple-value-bind (id revision hidden)
       (existing-link-info (gethash "id" new-link))
-    (unless id
-      (send-permalink (gethash "permalink" new-link)))
     (unless hidden
       (setf (gethash "type" new-link) "link")
       (setf (gethash "written" new-link) (get-universal-time))
@@ -377,22 +379,25 @@
                                     (get-subreddit-links subreddit :latest-id (or latest-id 0)))))))
        (couch-query (list (cons "type" "subreddit")))))
 
-(defun start-refresh-threads ()
+(defun find-links-by-pattern (pattern)
+  (gethash "docs"
+           (yason:parse
+            (doc-find "reddit" (make-selector
+                                (list (cons "title" (alist-hash-table
+                                                     (list (cons "$regex" pattern)))))
+                                :limit 20000)))))
 
+(defun start-refresh-threads ()
   (bt:make-thread (lambda ()
                     (loop
                       (authenticate)
                       (sync-subreddits)
-                      (scan-links)))
-                  :name "sup post fetcher")
-  (bt:make-thread (lambda ()
-                    (loop
+                      (scan-links)
                       (scan-comments)
                       (sleep (* 5 60))))
-                  :name "sup comment fetcher"))
+                  :name "sup post fetcher"))
 
 (defun stop-refresh-threads ()
-  (cl-ivy:stop-threads-by-name "sup comment fetcher")
   (cl-ivy:stop-thread-by-name "sup post fetcher"))
 
 (defun mark-subreddit-as-read (subreddit)
@@ -426,8 +431,6 @@
         (:span.pull-right
          ("~a/~a" (gethash "ups" comment)
                   (gethash "downs" comment)))
-        ("~a" (gethash "_id" comment))
-        (:br)
         (:a :href (format nil "https://reddit.com/u/~a" (gethash "author" comment)) (gethash "author" comment))
         (:br)
         (:span :style "font-size:14px;"
@@ -457,117 +460,156 @@
                                   (list (cons "ups" "desc")))))))
     (with-html-string (map 'nil #'display-comment comments))))
 
-(defun display-link (doc-hash)
-  (with-html
-    (let ((unique-id (format nil "~a" (uuid:make-v4-uuid))))
-      (:div.row :id (format nil "wx~a" unique-id)
-                (:div.col-md-6
-                 (:div.panel.panel-default.panel-borders.panel-heading-fullwidth
-                  :style "border:1px solid rgb(7,7,7);"
-                  (:div.panel-heading
-                   (:div.tools
-                    (:div.icon
-                     (:a :href (format nil "/link/~a" (hash-get doc-hash '("id")))
-                       (:i :class "s7-link")))
-                    (:div.icon :id (format nil "favorite-~a" unique-id)
-                               (:span.s7-download))
-                    (:div.icon :id (format nil "hide-~a" unique-id)
-                               (:span.s7-close-circle)))
-                   (:div.pull-right
-                    ("~a/~a   " (gethash "ups" doc-hash)
-                                (gethash "downs" doc-hash)))
-                   ("~a" (gethash "_id" doc-hash))
-                   (:br)
-                   (when-let ((title (gethash "title" doc-hash)))
-                     (if-let ((url (gethash "url" doc-hash)))
-                       (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
-                         :href url title)
-                       title)
-                     (:br)
-                     (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
-                       :href (format nil "https://www.reddit.com~a" (gethash "permalink" doc-hash))
-                       (gethash "subreddit" doc-hash)))
-                   (:script
-                     (ps:ps*
-                      `(with-document-ready
-                           (lambda ()
-                             (-> (sel ,(format nil "#favorite-~a" unique-id))
-                                 (click (lambda (e)
-                                          (chain (sel ,(format nil "#wx~a" unique-id))
-                                                 (load ,(format nil "/link/favorite/~a" (gethash "id" doc-hash))))
-                                          (-> (sel ,(format nil "#wx~a" unique-id))
-                                              (toggle))
-                                          (-> e (prevent-default)))))
-                             (-> (sel ,(format nil "#hide-~a" unique-id))
-                                 (click (lambda (e)
-                                          (chain (sel ,(format nil "#wx~a" unique-id))
-                                                 (load ,(format nil "/link/hide/~a" (gethash "id" doc-hash))))
-                                          (-> (sel ,(format nil "#wx~a" unique-id))
-                                              (toggle))
-                                          (-> e (prevent-default))))))))))
-                  (:div.panel-body
-                   (:div.row
-                    (:div.col-md-12
+(defroute show-link-body ("/link/body/:id") ()
+  (let ((doc-hash (yason:parse (doc-get "reddit" id))))
+    (with-html-string
+      (:div.row
+       (:div.col-md-12
+        (let ((crossposted-reddit-video (hash-get doc-hash '("crosspost_parent_list" 0 "secure_media" "reddit_video" "fallback_url")))
+              (crossposted-media-content (hash-get doc-hash '("crosspost_parent_list" 0 "media_embed" "content")))
+              (reddit-preview-of-imgur-gif (hash-get doc-hash '("preview" "reddit_video_preview" "fallback_url")))
+              (is-reddit-video (hash-get doc-hash '("secure_media" "reddit_video" "fallback_url")))
+              (is-embedded-image (hash-get doc-hash '("preview" "images")))
+              (has-selftext (hash-get doc-hash '("selftext_html")))
+              (has-oembed-media (hash-get doc-hash '("secure_media" "oembed" "html")))
+              (url-is-imgur-image (when-let ((url (gethash "url" doc-hash)))
+                                    (when (ppcre:scan "imgur.com" url)
+                                      (ppcre:regex-replace "https?://i?.?imgur.com/" url ""))))
+              (url-is-video (when-let ((url (gethash "url" doc-hash)))
+                              (when (ppcre:scan ".mp4|.MP4" url)
+                                url)))
+              (url-is-image (when-let ((url (gethash "url" doc-hash)))
+                              (when (ppcre:scan ".jpg$|.png$|.gif$|.JPG$|.PNG$|.GIF$" url)
+                                url)))
+              (has-crosspost-parent-media (let ((crosspost-parent-list
+                                                  (hash-get doc-hash '("crosspost_parent_list"))))
+                                            (when (listp crosspost-parent-list)
+                                              (hash-get (car crosspost-parent-list)
+                                                        '("preview" "reddit_video_preview" "fallback_url"))))))
+          (cond (crossposted-reddit-video (:video :preload "auto" :class "img-responsive" :controls 1
+                                            (:source :src crossposted-reddit-video)))
+                (reddit-preview-of-imgur-gif (:video :preload "auto" :class "img-responsive" :controls 1
+                                               (:source :src reddit-preview-of-imgur-gif)))
+                (has-oembed-media (:raw (html-entities:decode-entities
+                                         has-oembed-media)))
+                (is-reddit-video (:video :preload "auto" :class "img-responsive" :controls 1
+                                   (:source :src is-reddit-video)))
+                ;; Matches if the post is a crosspost and the original
+                ;; has a video hosted at reddit
+                (crossposted-media-content (:raw (html-entities:decode-entities
+                                                  crossposted-media-content)))
+                (has-crosspost-parent-media (progn
+                                              (log:info "Yes!")
+                                              (:video :preload "auto" :class "img-responsive" :controls 1
+                                                (:source :src has-crosspost-parent-media))))
+                (is-embedded-image (dolist (image-hash is-embedded-image)
+                                     (cond ((hash-get image-hash '("variants"))
+                                            (let ((has-mp4 (hash-get image-hash
+                                                                     '("variants"
+                                                                       "mp4"
+                                                                       "source"
+                                                                       "url")))
+                                                  (has-gif (hash-get image-hash
+                                                                     '("variants"
+                                                                       "gif"
+                                                                       "source"
+                                                                       "url")))
+                                                  (has-still-image (hash-get image-hash '("source" "url"))))
+                                              (cond (has-mp4 (:video :preload "auto" :class "img-responsive"
+                                                               :controls 1
+                                                               (:source :src (html-entities:decode-entities has-mp4))))
+                                                    (has-gif (:img :class "img-responsive"
+                                                               :src (html-entities:decode-entities has-gif)))
+                                                    (has-still-image (:img :class "img-responsive"
+                                                                       :src (html-entities:decode-entities has-still-image)))))))))
+                (has-selftext (:raw (html-entities:decode-entities has-selftext)))
+                (url-is-image (:img.img-responsive :src url-is-image))
+                (url-is-video (:video :class "img-responsive" :preload "auto" :controls "1"
+                                (:source :src (html-entities:decode-entities url-is-video))))
+                (url-is-imgur-image (:blockquote.imgur-embed-pub :data-id url-is-imgur-image)
+                                    (:script :src "//s.imgur.com/min/embed.js")))))))))
 
-                     (let ((crossposted-reddit-video (hash-get doc-hash '("crosspost_parent_list" 0 "secure_media" "reddit_video" "fallback_url")))
-                           (reddit-preview-of-imgur-gif (hash-get doc-hash '("preview" "reddit_video_preview" "fallback_url")))
-                           (is-reddit-video (hash-get doc-hash '("secure_media" "reddit_video" "fallback_url")))
-                           (is-embedded-image (hash-get doc-hash '("preview" "images")))
-                           (has-selftext (hash-get doc-hash '("selftext_html")))
-                           (has-oembed-media (hash-get doc-hash '("secure_media" "oembed" "html")))
-                           (has-crosspost-parent-media (let ((crosspost-parent-list (hash-get doc-hash '("crosspost_parent_list"))))
-                                                         (when (listp crosspost-parent-list)
-                                                           (hash-get (car crosspost-parent-list)
-                                                                     '("preview" "reddit_video_preview" "fallback_url"))))))
-                       (cond (crossposted-reddit-video (:video :class "img-responsive" :controls 1
-                                                         (:source :src crossposted-reddit-video)))
-                             (reddit-preview-of-imgur-gif (:video :class "img-responsive" :controls 1
-                                                                                          (:source :src reddit-preview-of-imgur-gif)))
-                             (has-oembed-media (:raw (html-entities:decode-entities
-                                                         has-oembed-media)))
-                             (is-reddit-video (:video :class "img-responsive" :controls 1
-                                                (:source :src is-reddit-video)))
-                             ;; Matches if the post is a crosspost and the original
-                             ;; has a video hosted at reddit
-                             (has-crosspost-parent-media (progn
-                                                           (log:info "Yes!")
-                                                           (:video :class "img-responsive" :controls 1
-                                                             (:source :src has-crosspost-parent-media))))
-                             (is-embedded-image (dolist (image-hash is-embedded-image)
-                                                  (cond ((hash-get image-hash '("variants"))
-                                                         (let ((has-mp4 (hash-get image-hash
-                                                                                  '("variants"
-                                                                                    "mp4"
-                                                                                    "source"
-                                                                                    "url")))
-                                                               (has-gif (hash-get image-hash
-                                                                                  '("variants"
-                                                                                    "gif"
-                                                                                    "source"
-                                                                                    "url")))
-                                                               (has-still-image (hash-get image-hash '("source" "url"))))
-                                                           (cond (has-mp4 (:video :class "img-responsive"
-                                                                            :controls 1
-                                                                            (:source :src (html-entities:decode-entities has-mp4))))
-                                                                 (has-gif (:img :class "img-responsive"
-                                                                            :src (html-entities:decode-entities has-gif)))
-                                                                 (has-still-image (:img :class "img-responsive"
-                                                                                    :src (html-entities:decode-entities has-still-image)))))))))
-                             (has-selftext (:raw (html-entities:decode-entities has-selftext)))))))
-                   (:div.row
-                    (:div.col-md-12
-                     (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
-                       :href (format nil "http://localhost:5984/_utils/#database/reddit/~a"
-                                     (gethash "_id" doc-hash))
-                       "db"))))))
-                (:div.col-md-6
-                 (:div.panel.panel-default.panel-borders
-                  :style "border:1px solid rgb(7,7,7);"
-                  (:div.panel-body :id (format nil "comments-~a" (gethash "id" doc-hash)))
-                  (:script
-                    (ps:ps* `(with-document-ready (lambda ()
-                                                    (-> (sel ,(format nil "#comments-~a" (gethash "id" doc-hash)))
-                                                        (load ,(format nil "/comments/~a" (gethash "id" doc-hash))))))))))))))
+(defun display-link (doc-id)
+  (let ((doc-hash (yason:parse (doc-get "reddit" (gethash "_id" doc-id)))))
+    (with-html
+      (let ((unique-id (format nil "~a" (uuid:make-v4-uuid))))
+        (:div.row :id (format nil "wx~a" unique-id)
+                  (:div.col-md-6
+                   (:div.panel.panel-default.panel-borders.panel-heading-fullwidth
+                    :style "border:1px solid rgb(7,7,7);"
+                    (:div.panel-heading
+                     (:div.tools (:div.icon
+                                  (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
+                                    :href (format nil "http://localhost:5984/_utils/#database/reddit/~a"
+                                                  (gethash "_id" doc-hash))
+                                    (:i :class "s7-server")))
+                                 (:div.icon
+                                  (:a :target (format nil "linky-~a" (uuid:make-v4-uuid))
+                                    :href (format nil "/link/~a" (hash-get doc-hash '("id")))
+                                    (:i :class "s7-link")))
+                                 (:div.icon :id (format nil "favorite-~a" unique-id)
+                                            (:span.s7-download))
+                                 (:div.icon :id (format nil "hide-~a" unique-id)
+                                            (:span.s7-close-circle)))
+                     (:div.pull-right
+                      ("~a/~a   " (gethash "ups" doc-hash)
+                                  (gethash "downs" doc-hash)))
+                     (when-let ((title (gethash "title" doc-hash)))
+                       (if-let ((url (gethash "url" doc-hash)))
+                         (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
+                           :href url (html-entities:decode-entities title))
+                         title)
+                       (:br)
+                       (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
+                         :href (format nil "https://www.reddit.com~a" (gethash "permalink" doc-hash))
+                         (gethash "subreddit" doc-hash)))
+                     (:script
+                       (ps:ps*
+                        `(with-document-ready
+                             (lambda ()
+                               (-> (sel ,(format nil "#favorite-~a" unique-id))
+                                   (click (lambda (e)
+                                            (chain (sel ,(format nil "#wx~a" unique-id))
+                                                   (load ,(format nil "/link/favorite/~a" (gethash "id" doc-hash))))
+                                            (-> (sel ,(format nil "#wx~a" unique-id))
+                                                (toggle))
+                                            (-> e (prevent-default)))))
+                               (-> (sel ,(format nil "#hide-~a" unique-id))
+                                   (click (lambda (e)
+                                            (chain (sel ,(format nil "#wx~a" unique-id))
+                                                   (load ,(format nil "/link/hide/~a" (gethash "id" doc-hash))))
+                                            (-> (sel ,(format nil "#wx~a" unique-id))
+                                                (toggle))
+                                            (-> e (prevent-default))))))))))
+                    (:script
+                      (ps:ps*
+                       `(with-document-ready (lambda ()
+                                               (-> (sel ,(format nil "#link-~a" unique-id))
+                                                   (load ,(format nil "/link/body/~a" (gethash "_id" doc-hash))))))))
+                    (:div.panel-body
+                     :id (format nil "link-~a" unique-id)
+                     )))
+                  (:div.col-md-6
+                   (:div.panel.panel-default.panel-borders.panel-heading-fullwidth
+                    :style "border:1px solid rgb(7,7,7);"
+                    (:div :class "panel-heading"
+                      (:div
+                        :class "icon"
+                        :onclick (ps:ps* `(if (string= (-> (sel ,(format nil "#comments-~a" (gethash "id" doc-hash)))
+                                                           (css "display"))
+                                                       "none")
+                                              (progn
+                                                (-> (sel ,(format nil "#comments-~a"
+                                                                  (gethash "id" doc-hash)))
+                                                    (toggle))
+                                                (-> (sel ,(format nil "#comments-~a" (gethash "id" doc-hash)))
+                                                    (load ,(format nil "/comments/~a" (gethash "id" doc-hash)))))
+                                              (-> (sel ,(format nil "#comments-~a"
+                                                                (gethash "id" doc-hash)))
+                                                  (toggle))))
+                        (:span :class "s7-download")))
+                    (:div.panel-body :id (format nil "comments-~a" (gethash "id" doc-hash))
+                                     :style "display:none;"))))))))
 
 (defroute hide-link ("/link/hide/:id") ()
   (when-let ((the-link (couch-query (list (cons "id" id)
@@ -592,7 +634,6 @@
         (remhash "suphidden" the-link)
         (doc-put "reddit" (to-json the-link)))
       (progn
-        (log:info "new favorite")
         (setf (gethash "favorite" the-link) 't)
         (setf (gethash "suphidden" the-link) 't)
         (doc-put "reddit" (to-json the-link))))))
@@ -605,27 +646,38 @@
       (display-comment (car comments)))))
 
 (defroute favorites ("/favorites") ()
-  (with-page ()
-    (mapcar #'display-link
-            (couch-query (list (cons "type" "link")
-                               (cons "favorite" 't))
-                         :sort (list (alist-hash-table
-                                      (list (cons "created" "desc"))))))))
+  (display-links (couch-query (list (cons "type" "link")
+                                    (cons "favorite" 't))
+                              :sort (list (alist-hash-table
+                                           (list (cons "created" "desc"))))
+                              :limit 10000)))
 
-(defroute links ("/links") ()
+(defun display-links (links)
   (with-page ()
     (:div :class "row"
-      (:div :class "col-md-6"
-        (:a :class "btn btn-default btn-xs"
-          :style "position:fixed;top:0;left:0;"
-          :href "/favorites" "Favorites")))
-    (map nil #'display-link
-         (couch-query (list (cons "type" "link")
-                            (cons "suphidden" (alist-hash-table
-                                               (list (cons "$exists" 'yason:false)))))
-                      :sort (list (alist-hash-table
-                                   (list (cons "created" "asc"))))
-                      :limit 100))))
+      (:div :class "col-md-12"
+        (:form :method :post :action "/search"
+          (:div :class "col-md-2"
+            (:div :class "btn-group btn-space"
+              (:a :class "btn btn-default btn-xs" :type "button" :href "/favorites" "Favorites")
+              (:a :class "btn btn-default btn-xs" :type "button" :href "/" "Index")
+              (:input :name "pattern" :type "text" :class "input-xs form-control pull-left" :placeholder "Search..." :id "searchtext"))))
+        (:div :class "col-md-10"
+          (:div :class "btn-group btn-space"
+            (map 'nil (lambda (subreddit)
+                        (:a :class "btn btn-primary btn-xs" :href (format nil "/subreddit/~a" (gethash "name" subreddit)) (gethash "display_name" subreddit)))
+                 (couch-query (list (cons "type" "subreddit"))))))))
+    (map nil #'display-link links)))
+
+(defroute links ("/links") ()
+  (display-links
+   (couch-query (list (cons "type" "link")
+                      (cons "suphidden" (alist-hash-table
+                                         (list (cons "$exists" 'yason:false)))))
+                :sort (list (alist-hash-table
+                             (list (cons "created" "asc"))))
+                :limit 600
+                :fields (list "_id"))))
 
 (defroute index ("/") ()
   (hunchentoot:redirect "/links"))
@@ -638,7 +690,7 @@
          (let ((ids (couch-query (list (cons "type" "link")
                                        (cons "subreddit" (gethash "display_name" subreddit)))
                                  :fields (list "id")
-                                 :limit 10000)))
+                                 :limit 500000)))
            (map nil
                 (lambda (ids)
                   (let ((dupes (couch-query (list (cons "type" "link")
@@ -658,14 +710,12 @@
     (with-page ()
       (display-link link))))
 
-(defun scan-this-shit ()
-  (let ((rows (couch-query (list (cons "type" "comment"))
-                    :limit 100000
-                    :fields (list "_id"))))
-    (dolist (row rows)
-      (let* ((id (gethash "_id" row))
-             (split-version (ppcre:split ":" id)))
-        (unless (or (string= (cadr split-version) "link")
-                    (string= (cadr split-version) "comment"))
-          (log:info id))))
-    (length rows)))
+(defroute link-search ("/search" :method :post) (pattern)
+  (display-links (find-links-by-pattern pattern)))
+
+(defroute display-subreddit ("/subreddit/:subid") ()
+  (display-links (couch-query (list (cons "type" "link")
+                                    (cons "subreddit_id" subid))
+                              :sort (list (alist-hash-table
+                                           (list (cons "created" "desc"))))
+                              :limit 1000)))
