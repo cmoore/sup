@@ -138,8 +138,22 @@
        ((>= i (@ ,list length)))
      (funcall ,func (aref ,list i))))
 
+(defparameter *person* nil)
+
+(defmacro with-session ((&key (require-user t)) &body body)
+  (alexandria:with-gensyms (this-person)
+    `(let* ((,this-person (alexandria:when-let ((uid (hunchentoot:cookie-in "uid")))
+                            (car (couch-query (list (cons "type" "person")
+                                                    (cons "uid" uid)))))))
+       (let ((*person* ,this-person))
+         ,(when require-user
+            `(unless (and *person* (hash-get *person* (list "email")))
+               (hunchentoot:redirect "https://r.ivy.io/login")))
+         ,@body))))
+
 (defmacro with-page ((&key
                         (title nil)
+                        (body-class nil)
                         (enable-page-header nil)) &body body)
   `(with-html-string
         (:doctype)
@@ -160,7 +174,7 @@
             (:link :rel "stylesheet" :type "text/css" :href "https://r.ivy.io/am/css/style.css")
             (:script :src "https://r.ivy.io/am/lib/jquery/jquery.min.js")
             (:style ".am-wrapper { padding-top: 0px !important; }"))
-          (:body :style "background-color:rgb(51,51,51);"
+          (:body :style "background-color:rgb(51,51,51);" ,@(when body-class `(:class ,body-class))
             (:div :class "am-wrapper am-nosidebar-left"
               (:div :class "am-content"
                 ,(when enable-page-header
@@ -176,6 +190,90 @@
             (:script :src "https://r.ivy.io/am/lib/bootstrap/dist/js/bootstrap.min.js")
             (:script :src "https://r.ivy.io/am/lib/jquery-ui/jquery-ui.min.js")
             (:script :src "https://r.ivy.io/gfycat.min.js")))))
+
+(defmacro with-login-page (&rest body)
+  `(with-page (:body-class "am-splash-screen")
+     (:div :class "am-wrapper am-login"
+       (:div :class "am-content"
+         (:div :class "main-content"
+           (:div :class "login-container"
+             (:div :class "panel panel-default"
+               (:div :class "panel-body"
+                 ,@body))))))))
+
+(defroute ui/login ("/login" :method :get) ()
+  (with-page (:body-class "am-splash-screen")
+    (:div :class "am-wrapper am-login"
+      (:div :class "am-content"
+        (:div :class "main-content"
+          (:div :class "login-container"
+            (:div :class "panel panel-default"
+              (:div :class "panel-body"
+                (:form :action "/login" :method "post" :class "form-horizontal"
+                  (:div :class "login-form"
+                    (:div :class "form-group"
+                      (:div :class "input-group"
+                        (:span :class "input-group-addon"
+                          (:i :class "icon s7-mail"))
+                        (:input
+                          :name "email"
+                          :type "email"
+                          :placeholder "Email"
+                          :autocomplete "off"
+                          :class "form-control")))
+                    (:div :class "form-group"
+                      (:div :class "input-group"
+                        (:span :class "input-group-addon"
+                          (:i :class "icon s7-lock"))
+                        (:input
+                          :name "password"
+                          :type "password"
+                          :placeholder "Password"
+                          :class "form-control")))
+                    (:div :class "form-group login-submit"
+                      (:button :data-dismiss "modal" :type "submit"
+                        :class "btn btn-primary btn-lg" "Log me in"))
+                    (:div :class "form-group footer row"
+                      (:div :class "col-xs-6"
+                        (:a :href "/signup" "Sign Up"))
+                      (:div :class "col-xs-6"
+                        (:a :class "pull-right" :href "/forgot" "Forgot password?")))))))))))))
+
+(defroute ui/logout ("/logout" :method :get) ()
+  (hunchentoot:set-cookie "uid" :value nil)
+  (hunchentoot:redirect "https://downvote.ivy.io/"))
+
+(defroute ui/login-post ("/login" :method :post) (email password)
+  (if (not (< 3 (length email)))
+      (redirect "https://downvote.ivy.io/login")
+      (alexandria:if-let ((person (car (couch-query (list (cons "type" "person")
+                                                          (cons "email" email)
+                                                          (cons "passwrod" (ivy:make-hash password)))))))
+        (progn (hunchentoot:set-cookie "uid"
+                                       :expires (local-time:timestamp-to-universal
+                                                 (local-time:unix-to-timestamp
+                                                  (+ (* 60 60 600)
+                                                     (local-time:timestamp-to-unix
+                                                      (local-time:now))))) 
+                                       :value (gethash "uid" person))
+               (hunchentoot:redirect "https://downvote.ivy.io/"))
+        
+        (with-login-page
+            (:div :class "am-wrapper am-login"
+              (:div :class "am-content"
+                (:div :class "main-content"
+                  (:div :class "login-container"
+                    (:div :class "panel panel-default"
+                      (:div :style "color:white;" :class "panel-body"
+                        (:span "Incorrect username or password."))))))
+              (:script
+                (ps:ps
+                  (with-document-ready
+                      (lambda ()
+                        (set-timeout
+                         (lambda ()
+                           (setf (@ window location) "/"))
+                         4000))))))))))
 
 (defun get-imgur-id (link)
   (when (ppcre:scan "imgur.com" link)
@@ -453,81 +551,83 @@
      (html-entities:decode-entities html))))
 
 (defroute show-comments ("/comments/:id") ()
-  (let ((comments (couch-query
+  (with-session ()
+    (let ((comments (couch-query
                      (list (cons "type" "comment")
                            (cons "link_id" (format nil "t3_~a" id)))
                      :sort (list (alist-hash-table
                                   (list (cons "ups" "desc")))))))
-    (with-html-string (map 'nil #'display-comment comments))))
+      (with-html-string (map 'nil #'display-comment comments)))))
 
 (defroute show-link-body ("/link/body/:id") ()
-  (let ((doc-hash (yason:parse (doc-get "reddit" id))))
-    (with-html-string
-      (:div.row
-       (:div.col-md-12
-        (let ((crossposted-reddit-video (hash-get doc-hash '("crosspost_parent_list" 0 "secure_media" "reddit_video" "fallback_url")))
-              (crossposted-media-content (hash-get doc-hash '("crosspost_parent_list" 0 "media_embed" "content")))
-              (reddit-preview-of-imgur-gif (hash-get doc-hash '("preview" "reddit_video_preview" "fallback_url")))
-              (is-reddit-video (hash-get doc-hash '("secure_media" "reddit_video" "fallback_url")))
-              (is-embedded-image (hash-get doc-hash '("preview" "images")))
-              (has-selftext (hash-get doc-hash '("selftext_html")))
-              (has-oembed-media (hash-get doc-hash '("secure_media" "oembed" "html")))
-              (url-is-imgur-image (when-let ((url (gethash "url" doc-hash)))
-                                    (when (ppcre:scan "imgur.com" url)
-                                      (ppcre:regex-replace "https?://i?.?imgur.com/" url ""))))
-              (url-is-video (when-let ((url (gethash "url" doc-hash)))
-                              (when (ppcre:scan ".mp4|.MP4" url)
-                                url)))
-              (url-is-image (when-let ((url (gethash "url" doc-hash)))
-                              (when (ppcre:scan ".jpg$|.png$|.gif$|.JPG$|.PNG$|.GIF$" url)
-                                url)))
-              (has-crosspost-parent-media (let ((crosspost-parent-list
-                                                  (hash-get doc-hash '("crosspost_parent_list"))))
-                                            (when (listp crosspost-parent-list)
-                                              (hash-get (car crosspost-parent-list)
-                                                        '("preview" "reddit_video_preview" "fallback_url"))))))
-          (cond (crossposted-reddit-video (:video :preload "auto" :class "img-responsive" :controls 1
-                                            (:source :src crossposted-reddit-video)))
-                (reddit-preview-of-imgur-gif (:video :preload "auto" :class "img-responsive" :controls 1
-                                               (:source :src reddit-preview-of-imgur-gif)))
-                (has-oembed-media (:raw (html-entities:decode-entities
-                                         has-oembed-media)))
-                (is-reddit-video (:video :preload "auto" :class "img-responsive" :controls 1
-                                   (:source :src is-reddit-video)))
-                ;; Matches if the post is a crosspost and the original
-                ;; has a video hosted at reddit
-                (crossposted-media-content (:raw (html-entities:decode-entities
-                                                  crossposted-media-content)))
-                (has-crosspost-parent-media (progn
-                                              (log:info "Yes!")
-                                              (:video :preload "auto" :class "img-responsive" :controls 1
-                                                (:source :src has-crosspost-parent-media))))
-                (is-embedded-image (dolist (image-hash is-embedded-image)
-                                     (cond ((hash-get image-hash '("variants"))
-                                            (let ((has-mp4 (hash-get image-hash
-                                                                     '("variants"
-                                                                       "mp4"
-                                                                       "source"
-                                                                       "url")))
-                                                  (has-gif (hash-get image-hash
-                                                                     '("variants"
-                                                                       "gif"
-                                                                       "source"
-                                                                       "url")))
-                                                  (has-still-image (hash-get image-hash '("source" "url"))))
-                                              (cond (has-mp4 (:video :preload "auto" :class "img-responsive"
-                                                               :controls 1
-                                                               (:source :src (html-entities:decode-entities has-mp4))))
-                                                    (has-gif (:img :class "img-responsive"
-                                                               :src (html-entities:decode-entities has-gif)))
-                                                    (has-still-image (:img :class "img-responsive"
-                                                                       :src (html-entities:decode-entities has-still-image)))))))))
-                (has-selftext (:raw (html-entities:decode-entities has-selftext)))
-                (url-is-image (:img.img-responsive :src url-is-image))
-                (url-is-video (:video :class "img-responsive" :preload "auto" :controls "1"
-                                (:source :src (html-entities:decode-entities url-is-video))))
-                (url-is-imgur-image (:blockquote.imgur-embed-pub :data-id url-is-imgur-image)
-                                    (:script :src "//s.imgur.com/min/embed.js")))))))))
+  (with-session ()
+    (let ((doc-hash (yason:parse (doc-get "reddit" id))))
+      (with-html-string
+        (:div.row
+         (:div.col-md-12
+          (let ((crossposted-reddit-video (hash-get doc-hash '("crosspost_parent_list" 0 "secure_media" "reddit_video" "fallback_url")))
+                (crossposted-media-content (hash-get doc-hash '("crosspost_parent_list" 0 "media_embed" "content")))
+                (reddit-preview-of-imgur-gif (hash-get doc-hash '("preview" "reddit_video_preview" "fallback_url")))
+                (is-reddit-video (hash-get doc-hash '("secure_media" "reddit_video" "fallback_url")))
+                (is-embedded-image (hash-get doc-hash '("preview" "images")))
+                (has-selftext (hash-get doc-hash '("selftext_html")))
+                (has-oembed-media (hash-get doc-hash '("secure_media" "oembed" "html")))
+                (url-is-imgur-image (when-let ((url (gethash "url" doc-hash)))
+                                      (when (ppcre:scan "imgur.com" url)
+                                        (ppcre:regex-replace "https?://i?.?imgur.com/" url ""))))
+                (url-is-video (when-let ((url (gethash "url" doc-hash)))
+                                (when (ppcre:scan ".mp4|.MP4" url)
+                                  url)))
+                (url-is-image (when-let ((url (gethash "url" doc-hash)))
+                                (when (ppcre:scan ".jpg$|.png$|.gif$|.JPG$|.PNG$|.GIF$" url)
+                                  url)))
+                (has-crosspost-parent-media (let ((crosspost-parent-list
+                                                    (hash-get doc-hash '("crosspost_parent_list"))))
+                                              (when (listp crosspost-parent-list)
+                                                (hash-get (car crosspost-parent-list)
+                                                          '("preview" "reddit_video_preview" "fallback_url"))))))
+            (cond (crossposted-reddit-video (:video :preload "auto" :class "img-responsive" :controls 1
+                                              (:source :src crossposted-reddit-video)))
+                  (reddit-preview-of-imgur-gif (:video :preload "auto" :class "img-responsive" :controls 1
+                                                 (:source :src reddit-preview-of-imgur-gif)))
+                  (has-oembed-media (:raw (html-entities:decode-entities
+                                           has-oembed-media)))
+                  (is-reddit-video (:video :preload "auto" :class "img-responsive" :controls 1
+                                     (:source :src is-reddit-video)))
+                  ;; Matches if the post is a crosspost and the original
+                  ;; has a video hosted at reddit
+                  (crossposted-media-content (:raw (html-entities:decode-entities
+                                                    crossposted-media-content)))
+                  (has-crosspost-parent-media (progn
+                                                (log:info "Yes!")
+                                                (:video :preload "auto" :class "img-responsive" :controls 1
+                                                  (:source :src has-crosspost-parent-media))))
+                  (is-embedded-image (dolist (image-hash is-embedded-image)
+                                       (cond ((hash-get image-hash '("variants"))
+                                              (let ((has-mp4 (hash-get image-hash
+                                                                       '("variants"
+                                                                         "mp4"
+                                                                         "source"
+                                                                         "url")))
+                                                    (has-gif (hash-get image-hash
+                                                                       '("variants"
+                                                                         "gif"
+                                                                         "source"
+                                                                         "url")))
+                                                    (has-still-image (hash-get image-hash '("source" "url"))))
+                                                (cond (has-mp4 (:video :preload "auto" :class "img-responsive"
+                                                                 :controls 1
+                                                                 (:source :src (html-entities:decode-entities has-mp4))))
+                                                      (has-gif (:img :class "img-responsive"
+                                                                 :src (html-entities:decode-entities has-gif)))
+                                                      (has-still-image (:img :class "img-responsive"
+                                                                         :src (html-entities:decode-entities has-still-image)))))))))
+                  (has-selftext (:raw (html-entities:decode-entities has-selftext)))
+                  (url-is-image (:img.img-responsive :src url-is-image))
+                  (url-is-video (:video :class "img-responsive" :preload "auto" :controls "1"
+                                  (:source :src (html-entities:decode-entities url-is-video))))
+                  (url-is-imgur-image (:blockquote.imgur-embed-pub :data-id url-is-imgur-image)
+                                      (:script :src "//s.imgur.com/min/embed.js"))))))))))
 
 (defun display-link (doc-id)
   (let ((doc-hash (yason:parse (doc-get "reddit" (gethash "_id" doc-id)))))
@@ -612,45 +712,49 @@
                                      :style "display:none;"))))))))
 
 (defroute hide-link ("/link/hide/:id") ()
-  (when-let ((the-link (couch-query (list (cons "id" id)
-                                          (cons "type" "link"))
-                                    :limit 1)))
-    (map nil (lambda (link)
-               (setf (gethash "suphidden" link) t)
-               (doc-put "reddit" (to-json link)))
-         (remove-if-not (lambda (x)
-                          (string= "link" (hash-get x (list "type"))))
-                        the-link)))
+  (with-session ()
+    (when-let ((the-link (couch-query (list (cons "id" id)
+                                            (cons "type" "link"))
+                                      :limit 1)))
+      (map nil (lambda (link)
+                 (setf (gethash "suphidden" link) t)
+                 (doc-put "reddit" (to-json link)))
+           (remove-if-not (lambda (x)
+                            (string= "link" (hash-get x (list "type"))))
+                          the-link))))
   "ok")
 
 (defroute favorite-link ("/link/favorite/:id") ()
-  (when-let ((the-link (car (couch-query (list (cons "id" id)
-                                          (cons "type" "link"))))))
-    (if-let ((is-hidden-already (gethash "suphidden" the-link nil)))
-      ;; The link is being hidden from /favorites and not /links
-      ;; So send it back into the viewable pile.
-      (progn
-        (remhash "favorite" the-link)
-        (remhash "suphidden" the-link)
-        (doc-put "reddit" (to-json the-link)))
-      (progn
-        (setf (gethash "favorite" the-link) 't)
-        (setf (gethash "suphidden" the-link) 't)
-        (doc-put "reddit" (to-json the-link))))))
+  (with-session ()
+    (when-let ((the-link (car (couch-query (list (cons "id" id)
+                                                 (cons "type" "link"))))))
+      (if-let ((is-hidden-already (gethash "suphidden" the-link nil)))
+        ;; The link is being hidden from /favorites and not /links
+        ;; So send it back into the viewable pile.
+        (progn
+          (remhash "favorite" the-link)
+          (remhash "suphidden" the-link)
+          (doc-put "reddit" (to-json the-link)))
+        (progn
+          (setf (gethash "favorite" the-link) 't)
+          (setf (gethash "suphidden" the-link) 't)
+          (doc-put "reddit" (to-json the-link)))))))
 
 (defroute render-comment ("/r/comment/:id") ()
   (declare (optimize (speed 3) (debug 0) (safety 1)))
-  (let ((comments (couch-query (list (cons "type" "comment")
-                                     (cons "id" id)))))
-    (with-html-string
-      (display-comment (car comments)))))
+  (with-session ()
+    (let ((comments (couch-query (list (cons "type" "comment")
+                                       (cons "id" id)))))
+      (with-html-string
+        (display-comment (car comments))))))
 
 (defroute favorites ("/favorites") ()
-  (display-links (couch-query (list (cons "type" "link")
-                                    (cons "favorite" 't))
-                              :sort (list (alist-hash-table
-                                           (list (cons "created" "desc"))))
-                              :limit 10000)))
+  (with-session ()
+    (display-links (couch-query (list (cons "type" "link")
+                                      (cons "favorite" 't))
+                                :sort (list (alist-hash-table
+                                             (list (cons "created" "desc"))))
+                                :limit 10000))))
 
 (defun display-links (links)
   (with-page ()
@@ -670,17 +774,19 @@
     (map nil #'display-link links)))
 
 (defroute links ("/links") ()
-  (display-links
-   (couch-query (list (cons "type" "link")
-                      (cons "suphidden" (alist-hash-table
-                                         (list (cons "$exists" 'yason:false)))))
-                :sort (list (alist-hash-table
-                             (list (cons "created" "asc"))))
-                :limit 600
-                :fields (list "_id"))))
+  (with-session ()
+    (display-links
+     (couch-query (list (cons "type" "link")
+                        (cons "suphidden" (alist-hash-table
+                                           (list (cons "$exists" 'yason:false)))))
+                  :sort (list (alist-hash-table
+                               (list (cons "created" "asc"))))
+                  :limit 600
+                  :fields (list "_id")))))
 
 (defroute index ("/") ()
-  (hunchentoot:redirect "/links"))
+  (with-session ()
+    (hunchentoot:redirect "/links")))
 
 (defun scan-for-duplicates ()
   (map nil
