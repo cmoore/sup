@@ -8,6 +8,8 @@
   :depends-on (:json-mop
                :drakma
                :uuid
+               :cl-ivy
+               :local-time
                :html-entities
                :easy-routes
                :parenscript
@@ -17,6 +19,5 @@
                :split-sequence
                :cl-hash-util
                :cl-mango
-               :safe-queue
-               :cl-ivy)
+               :safe-queue)
   :components ((:file "sup")))

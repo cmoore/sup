@@ -44,15 +44,6 @@
           :json-key "scope"))
   (:metaclass json-serializable-class))
 
-(defmethod cl-ivy:make-hash ((object string))
-  (cl-ivy:make-hash object))
-
-(defmethod cl-ivy:make-hash ((object hash-table))
-  (cl-ivy:make-hash (to-json object)))
-
-(defmethod cl-ivy:make-hash ((object list))
-  (cl-ivy:make-hash (to-json object)))
-
 (defmacro couch-query (selector &rest args)
   `(gethash "docs" (yason:parse
                     (doc-find "reddit" (make-selector ,selector ,@args)))))
@@ -103,12 +94,16 @@
 
 (defgeneric to-json (a)
   (:method ((object hash-table))
-   (with-output-to-string (sink)
-     (yason:encode object sink)))
+    (with-output-to-string (sink)
+      (yason:encode object sink)))
 
+  (:method ((object string))
+    (with-output-to-string (sink)
+      (yason:encode object sink)))
+  
   (:method ((object list))
-   (with-output-to-string (sink)
-     (yason:encode object sink))))
+    (with-output-to-string (sink)
+      (yason:encode object sink))))
 
 (defun resource-path (path)
   (truename
@@ -148,7 +143,7 @@
        (let ((*person* ,this-person))
          ,(when require-user
             `(unless (and *person* (hash-get *person* (list "email")))
-               (hunchentoot:redirect "https://r.ivy.io/login")))
+               (hunchentoot:redirect "/login")))
          ,@body))))
 
 (defmacro with-page ((&key
@@ -201,79 +196,11 @@
                (:div :class "panel-body"
                  ,@body))))))))
 
-(defroute ui/login ("/login" :method :get) ()
-  (with-page (:body-class "am-splash-screen")
-    (:div :class "am-wrapper am-login"
-      (:div :class "am-content"
-        (:div :class "main-content"
-          (:div :class "login-container"
-            (:div :class "panel panel-default"
-              (:div :class "panel-body"
-                (:form :action "/login" :method "post" :class "form-horizontal"
-                  (:div :class "login-form"
-                    (:div :class "form-group"
-                      (:div :class "input-group"
-                        (:span :class "input-group-addon"
-                          (:i :class "icon s7-mail"))
-                        (:input
-                          :name "email"
-                          :type "email"
-                          :placeholder "Email"
-                          :autocomplete "off"
-                          :class "form-control")))
-                    (:div :class "form-group"
-                      (:div :class "input-group"
-                        (:span :class "input-group-addon"
-                          (:i :class "icon s7-lock"))
-                        (:input
-                          :name "password"
-                          :type "password"
-                          :placeholder "Password"
-                          :class "form-control")))
-                    (:div :class "form-group login-submit"
-                      (:button :data-dismiss "modal" :type "submit"
-                        :class "btn btn-primary btn-lg" "Log me in"))
-                    (:div :class "form-group footer row"
-                      (:div :class "col-xs-6"
-                        (:a :href "/signup" "Sign Up"))
-                      (:div :class "col-xs-6"
-                        (:a :class "pull-right" :href "/forgot" "Forgot password?")))))))))))))
-
-(defroute ui/logout ("/logout" :method :get) ()
-  (hunchentoot:set-cookie "uid" :value nil)
-  (hunchentoot:redirect "https://downvote.ivy.io/"))
-
-(defroute ui/login-post ("/login" :method :post) (email password)
-  (if (not (< 3 (length email)))
-      (redirect "https://downvote.ivy.io/login")
-      (alexandria:if-let ((person (car (couch-query (list (cons "type" "person")
-                                                          (cons "email" email)
-                                                          (cons "passwrod" (ivy:make-hash password)))))))
-        (progn (hunchentoot:set-cookie "uid"
-                                       :expires (local-time:timestamp-to-universal
-                                                 (local-time:unix-to-timestamp
-                                                  (+ (* 60 60 600)
-                                                     (local-time:timestamp-to-unix
-                                                      (local-time:now))))) 
-                                       :value (gethash "uid" person))
-               (hunchentoot:redirect "https://downvote.ivy.io/"))
-        
-        (with-login-page
-            (:div :class "am-wrapper am-login"
-              (:div :class "am-content"
-                (:div :class "main-content"
-                  (:div :class "login-container"
-                    (:div :class "panel panel-default"
-                      (:div :style "color:white;" :class "panel-body"
-                        (:span "Incorrect username or password."))))))
-              (:script
-                (ps:ps
-                  (with-document-ready
-                      (lambda ()
-                        (set-timeout
-                         (lambda ()
-                           (setf (@ window location) "/"))
-                         4000))))))))))
+(defun make-hash (string)
+  (ironclad:byte-array-to-hex-string
+   (ironclad:digest-sequence
+    :sha256
+    (ironclad:ascii-string-to-byte-array string))))
 
 (defun get-imgur-id (link)
   (when (ppcre:scan "imgur.com" link)
@@ -461,7 +388,9 @@
             (setf (gethash "_rev" new-link) revision))
           (setf (gethash "_id" new-link) (make-id new-link)))
       (handler-case
-          (cl-mango:doc-put "reddit" (to-json new-link))
+          (progn
+            (cl-mango:doc-put "reddit" (to-json new-link))
+            (comments-handle-link (gethash "permalink" new-link)))
         (cl-mango:unexpected-http-response (condition)
           (declare (ignore condition))
           nil)))))
@@ -478,12 +407,45 @@
        (couch-query (list (cons "type" "subreddit")))))
 
 (defun find-links-by-pattern (pattern)
-  (gethash "docs"
-           (yason:parse
-            (doc-find "reddit" (make-selector
-                                (list (cons "title" (alist-hash-table
-                                                     (list (cons "$regex" pattern)))))
-                                :limit 20000)))))
+  (hash-extract "_id"
+                (gethash "docs"
+                         (yason:parse
+                          (doc-find "reddit" (make-selector
+                                              (list (cons "type" "link")
+                                                    (cons "title" (alist-hash-table
+                                                                   (list (cons "$regex" pattern)))))
+                                              :limit 20000))))))
+
+(defparameter *feed-list* (list (list "Clozure master" "https://github.com/Clozure/ccl/commits/master.atom")
+                                (list "log4cl master" "https://github.com/sharplispers/log4cl/commits/master.atom")))
+
+(defun update-feeds ()
+  (map nil
+       (lambda (feed)
+         (destructuring-bind (feed-name feed-url) feed
+           (let* ((parsed (ignore-errors
+                           (gethash :entries
+                                    (cl-feedparser:parse-feed
+                                     (drakma:http-request feed-url))))))
+             (map nil (lambda (story)
+                        (unless (couch-query (list (cons "id" (gethash :id story))))
+                          (doc-put "reddit" (to-json
+                                             (alist-hash-table
+                                              (list (cons "id" (gethash :id story))
+                                                    (cons "type" "link")
+                                                    (cons "ups" 0)
+                                                    (cons "downs" 0)
+                                                    (cons "selftext_html" (hash-get story (list :content 0 :value)))
+                                                    (cons "url" (gethash :link story))
+                                                    (cons "permalink" (gethash :link story))
+                                                    (cons "subreddit" "RSS")
+                                                    (cons "name" "RSS")
+                                                    (cons "created" (get-universal-time))
+                                                    (cons "title" (format nil "~a ~a"
+                                                                          feed-name
+                                                                          (gethash :title story)))))))))
+                  parsed))))
+       *feed-list*))
 
 (defun start-refresh-threads ()
   (bt:make-thread (lambda ()
@@ -492,6 +454,7 @@
                       (sync-subreddits)
                       (scan-links)
                       (scan-comments)
+                      (update-feeds)
                       (sleep (* 5 60))))
                   :name "sup post fetcher"))
 
@@ -549,6 +512,250 @@
   (with-html
     (:raw
      (html-entities:decode-entities html))))
+
+(defun display-link (doc-id)
+  (let ((doc-hash (yason:parse (doc-get "reddit" doc-id))))
+    (with-html
+      (let ((unique-id (format nil "~a" (uuid:make-v4-uuid))))
+        (:div.row :id (format nil "wx~a" unique-id)
+                  (:div.col-md-6
+                   (:div.panel.panel-default.panel-borders.panel-heading-fullwidth
+                    :style "border:1px solid rgb(7,7,7);"
+                    (:div.panel-heading
+                     (:div.tools (:div.icon
+                                  (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
+                                    :href (format nil "https://grid.ivy.io/_utils/#database/reddit/~a" doc-id)
+                                    (:i :class "s7-server")))
+                                 (:div.icon
+                                  (:a :target (format nil "linky-~a" (uuid:make-v4-uuid))
+                                    :href (format nil "/link/~a" (hash-get doc-hash '("_id")))
+                                    (:i :class "s7-link")))
+                                 (:div.icon :id (format nil "favorite-~a" unique-id)
+                                            (:span.s7-download))
+                                 (:div.icon :id (format nil "hide-~a" unique-id)
+                                            (:span.s7-close-circle)))
+                     (:div.pull-right
+                      ("~a/~a   " (gethash "ups" doc-hash)
+                                  (gethash "downs" doc-hash)))
+                     (when-let ((title (gethash "title" doc-hash)))
+                       (if-let ((url (gethash "url" doc-hash)))
+                         (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
+                           :href url (html-entities:decode-entities title))
+                         title)
+                       (:br)
+                       (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
+                         :href (format nil "https://www.reddit.com~a" (gethash "permalink" doc-hash))
+                         (gethash "subreddit" doc-hash)))
+                     (:script
+                       (ps:ps*
+                        `(with-document-ready
+                             (lambda ()
+                               (-> (sel ,(format nil "#favorite-~a" unique-id))
+                                   (click (lambda (e)
+                                            (chain (sel ,(format nil "#wx~a" unique-id))
+                                                   (load ,(format nil "/link/favorite/~a" (gethash "id" doc-hash))))
+                                            (-> (sel ,(format nil "#wx~a" unique-id))
+                                                (toggle))
+                                            (-> e (prevent-default)))))
+                               (-> (sel ,(format nil "#hide-~a" unique-id))
+                                   (click (lambda (e)
+                                            (chain (sel ,(format nil "#wx~a" unique-id))
+                                                   (load ,(format nil "/link/hide/~a" (hunchentoot:url-encode
+                                                                                       (gethash "id" doc-hash)))))
+                                            (-> (sel ,(format nil "#wx~a" unique-id))
+                                                (toggle))
+                                            (-> e (prevent-default))))))))))
+                    (:script
+                      (ps:ps*
+                       `(with-document-ready (lambda ()
+                                               (-> (sel ,(format nil "#link-~a" unique-id))
+                                                   (load ,(format nil "/link/body/~a" (gethash "_id" doc-hash))))))))
+                    (:div.panel-body
+                     :id (format nil "link-~a" unique-id))))
+                  (:div.col-md-6
+                   (:div.panel.panel-default.panel-borders.panel-heading-fullwidth
+                    :style "border:1px solid rgb(7,7,7);"
+                    (:div :class "panel-heading"
+                      (:div
+                        :class "icon"
+                        :onclick (ps:ps* `(if (string= (-> (sel ,(format nil "#comments-~a" (gethash "id" doc-hash)))
+                                                           (css "display"))
+                                                       "none")
+                                              (progn
+                                                (-> (sel ,(format nil "#comments-~a"
+                                                                  (gethash "id" doc-hash)))
+                                                    (toggle))
+                                                (-> (sel ,(format nil "#comments-~a" (gethash "id" doc-hash)))
+                                                    (load ,(format nil "/comments/~a" (gethash "id" doc-hash)))))
+                                              (-> (sel ,(format nil "#comments-~a"
+                                                                (gethash "id" doc-hash)))
+                                                  (toggle))))
+                        (:span :class "s7-download")))
+                    (:div.panel-body :id (format nil "comments-~a" (gethash "id" doc-hash))
+                                     :style "display:none;"))))))))
+
+(defun display-links (link-ids)
+  (with-page ()
+    (:div :class "row"
+      (:div :class "col-md-12"
+        (:form :method :post :action "/search"
+          (:div :class "col-md-2"
+            (:div :class "btn-group btn-space"
+              (:a :class "btn btn-default btn-xs" :type "button" :href "/favorites" "Favorites")
+              (:a :class "btn btn-default btn-xs" :type "button" :href "/" "Index")
+              (:input :name "pattern" :type "text" :class "input-xs form-control pull-left" :placeholder "Search..." :id "searchtext"))))
+        (:div :class "col-md-10"
+          (:div :class "btn-group btn-space"
+            (map 'nil (lambda (subreddit)
+                        (:a :class "btn btn-primary btn-xs" :href (format nil "/subreddit/~a" (gethash "name" subreddit)) (gethash "display_name" subreddit)))
+                 (couch-query (list (cons "type" "subreddit"))))))))
+    (map nil #'display-link link-ids)))
+
+(defun scan-for-duplicates ()
+  (map nil
+       (lambda (subreddit)
+         (let ((name (gethash "display_name" subreddit)))
+           (log:info name))
+         (let ((ids (couch-query (list (cons "type" "link")
+                                       (cons "subreddit" (gethash "display_name" subreddit)))
+                                 :fields (list "id")
+                                 :limit 500000)))
+           (map nil
+                (lambda (ids)
+                  (let ((dupes (couch-query (list (cons "type" "link")
+                                                  (cons "id" (gethash "id" ids))))))
+                    (when (< 1 (length dupes))
+                      (map nil (lambda (bye)
+                                 (doc-delete "reddit" (gethash "_id" bye) (gethash "_rev" bye)))
+                           (cdr dupes))
+                      (let ((good (gethash "id" (car dupes))))
+                        (log:info "purged" good)))))
+                ids)))
+       (get-db-subreddits)))
+
+
+
+
+
+
+
+
+
+
+
+(defroute ui/login ("/login" :method :get) ()
+  (with-page (:body-class "am-splash-screen")
+    (:div :class "am-wrapper am-login"
+      (:div :class "am-content"
+        (:div :class "main-content"
+          (:div :class "login-container"
+            (:div :class "panel panel-default"
+              (:div :class "panel-body"
+                (:form :action "/login" :method "post" :class "form-horizontal"
+                  (:div :class "login-form"
+                    (:div :class "form-group"
+                      (:div :class "input-group"
+                        (:span :class "input-group-addon"
+                          (:i :class "icon s7-mail"))
+                        (:input
+                          :name "email"
+                          :type "email"
+                          :placeholder "Email"
+                          :autocomplete "off"
+                          :class "form-control")))
+                    (:div :class "form-group"
+                      (:div :class "input-group"
+                        (:span :class "input-group-addon"
+                          (:i :class "icon s7-lock"))
+                        (:input
+                          :name "password"
+                          :type "password"
+                          :placeholder "Password"
+                          :class "form-control")))
+                    (:div :class "form-group login-submit"
+                      (:button :data-dismiss "modal" :type "submit"
+                        :class "btn btn-primary btn-lg" "Log me in"))
+                    (:div :class "form-group footer row"
+                      (:div :class "col-xs-6"
+                        (:a :href "/signup" "Sign Up"))
+                      (:div :class "col-xs-6"
+                        (:a :class "pull-right" :href "/forgot" "Forgot password?")))))))))))))
+
+(defroute ui/logout ("/logout" :method :get) ()
+  (hunchentoot:set-cookie "uid" :value nil)
+  (hunchentoot:redirect "https://downvote.ivy.io/"))
+
+(defroute display-single-link ("/link/:id") ()
+  (with-page ()
+    (display-link id)))
+
+(defroute link-search ("/search" :method :post) (pattern)
+  (display-links (find-links-by-pattern pattern)))
+
+(defroute display-subreddit ("/subreddit/:subid") ()
+  (display-links
+   (hash-extract "id"
+                 (cl-mango:query-view "reddit"
+                                      "tests"
+                                      "by-subreddit"
+                                      :parameters (list (cons "key" (to-json subid))
+                                                        (cons "limit" "500")
+                                                        (cons "descending" (with-output-to-string (sink)
+                                                                             (yason:encode 'yason:true sink))))))))
+
+(defroute favorites ("/favorites") ()
+  (with-session ()
+    (display-links
+     (hash-extract "id"
+                   (cl-mango:query-view "reddit" "tests" "favorites"
+                                        :parameters (list (cons "limit" "500")
+                                                          (cons "descending" (with-output-to-string (sink)
+                                                                               (yason:encode 'yason:true sink)))))))))
+
+(defroute links ("/links") ()
+  (with-session ()
+    (display-links (hash-extract "id" (cl-mango:query-view "reddit" "tests" "links")))))
+
+(defroute index ("/") ()
+  (with-session ()
+    (hunchentoot:redirect "/links")))
+
+(defroute hide-link ("/link/hide/:id") ()
+  (with-session ()
+    (when-let ((the-link (couch-query (list (cons "id" id)
+                                            (cons "type" "link"))
+                                      :limit 1)))
+      (map nil (lambda (link)
+                 (setf (gethash "suphidden" link) t)
+                 (doc-put "reddit" (to-json link)))
+           (remove-if-not (lambda (x)
+                            (string= "link" (hash-get x (list "type"))))
+                          the-link))))
+  "ok")
+
+(defroute favorite-link ("/link/favorite/:id") ()
+  (with-session ()
+    (when-let ((the-link (car (couch-query (list (cons "id" id)
+                                                 (cons "type" "link"))))))
+      (if-let ((is-hidden-already (gethash "suphidden" the-link nil)))
+        ;; The link is being hidden from /favorites and not /links
+        ;; So send it back into the viewable pile.
+        (progn
+          (remhash "favorite" the-link)
+          (remhash "suphidden" the-link)
+          (doc-put "reddit" (to-json the-link)))
+        (progn
+          (setf (gethash "favorite" the-link) 't)
+          (setf (gethash "suphidden" the-link) 't)
+          (doc-put "reddit" (to-json the-link)))))))
+
+(defroute render-comment ("/r/comment/:id") ()
+  (declare (optimize (speed 3) (debug 0) (safety 1)))
+  (with-session ()
+    (let ((comments (couch-query (list (cons "type" "comment")
+                                       (cons "id" id)))))
+      (with-html-string
+        (display-comment (car comments))))))
 
 (defroute show-comments ("/comments/:id") ()
   (with-session ()
@@ -629,199 +836,35 @@
                   (url-is-imgur-image (:blockquote.imgur-embed-pub :data-id url-is-imgur-image)
                                       (:script :src "//s.imgur.com/min/embed.js"))))))))))
 
-(defun display-link (doc-id)
-  (let ((doc-hash (yason:parse (doc-get "reddit" (gethash "_id" doc-id)))))
-    (with-html
-      (let ((unique-id (format nil "~a" (uuid:make-v4-uuid))))
-        (:div.row :id (format nil "wx~a" unique-id)
-                  (:div.col-md-6
-                   (:div.panel.panel-default.panel-borders.panel-heading-fullwidth
-                    :style "border:1px solid rgb(7,7,7);"
-                    (:div.panel-heading
-                     (:div.tools (:div.icon
-                                  (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
-                                    :href (format nil "http://localhost:5984/_utils/#database/reddit/~a"
-                                                  (gethash "_id" doc-hash))
-                                    (:i :class "s7-server")))
-                                 (:div.icon
-                                  (:a :target (format nil "linky-~a" (uuid:make-v4-uuid))
-                                    :href (format nil "/link/~a" (hash-get doc-hash '("id")))
-                                    (:i :class "s7-link")))
-                                 (:div.icon :id (format nil "favorite-~a" unique-id)
-                                            (:span.s7-download))
-                                 (:div.icon :id (format nil "hide-~a" unique-id)
-                                            (:span.s7-close-circle)))
-                     (:div.pull-right
-                      ("~a/~a   " (gethash "ups" doc-hash)
-                                  (gethash "downs" doc-hash)))
-                     (when-let ((title (gethash "title" doc-hash)))
-                       (if-let ((url (gethash "url" doc-hash)))
-                         (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
-                           :href url (html-entities:decode-entities title))
-                         title)
-                       (:br)
-                       (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
-                         :href (format nil "https://www.reddit.com~a" (gethash "permalink" doc-hash))
-                         (gethash "subreddit" doc-hash)))
-                     (:script
-                       (ps:ps*
-                        `(with-document-ready
-                             (lambda ()
-                               (-> (sel ,(format nil "#favorite-~a" unique-id))
-                                   (click (lambda (e)
-                                            (chain (sel ,(format nil "#wx~a" unique-id))
-                                                   (load ,(format nil "/link/favorite/~a" (gethash "id" doc-hash))))
-                                            (-> (sel ,(format nil "#wx~a" unique-id))
-                                                (toggle))
-                                            (-> e (prevent-default)))))
-                               (-> (sel ,(format nil "#hide-~a" unique-id))
-                                   (click (lambda (e)
-                                            (chain (sel ,(format nil "#wx~a" unique-id))
-                                                   (load ,(format nil "/link/hide/~a" (gethash "id" doc-hash))))
-                                            (-> (sel ,(format nil "#wx~a" unique-id))
-                                                (toggle))
-                                            (-> e (prevent-default))))))))))
-                    (:script
-                      (ps:ps*
-                       `(with-document-ready (lambda ()
-                                               (-> (sel ,(format nil "#link-~a" unique-id))
-                                                   (load ,(format nil "/link/body/~a" (gethash "_id" doc-hash))))))))
-                    (:div.panel-body
-                     :id (format nil "link-~a" unique-id)
-                     )))
-                  (:div.col-md-6
-                   (:div.panel.panel-default.panel-borders.panel-heading-fullwidth
-                    :style "border:1px solid rgb(7,7,7);"
-                    (:div :class "panel-heading"
-                      (:div
-                        :class "icon"
-                        :onclick (ps:ps* `(if (string= (-> (sel ,(format nil "#comments-~a" (gethash "id" doc-hash)))
-                                                           (css "display"))
-                                                       "none")
-                                              (progn
-                                                (-> (sel ,(format nil "#comments-~a"
-                                                                  (gethash "id" doc-hash)))
-                                                    (toggle))
-                                                (-> (sel ,(format nil "#comments-~a" (gethash "id" doc-hash)))
-                                                    (load ,(format nil "/comments/~a" (gethash "id" doc-hash)))))
-                                              (-> (sel ,(format nil "#comments-~a"
-                                                                (gethash "id" doc-hash)))
-                                                  (toggle))))
-                        (:span :class "s7-download")))
-                    (:div.panel-body :id (format nil "comments-~a" (gethash "id" doc-hash))
-                                     :style "display:none;"))))))))
+(defroute ui/login-post ("/login" :method :post) (email password)
+  (if (not (< 3 (length email)))
+      (redirect "https://downvote.ivy.io/login")
+      (alexandria:if-let ((person (car (couch-query (list (cons "type" "person")
+                                                          (cons "email" email)
+                                                          (cons "password" (make-hash password)))))))
+        (progn (hunchentoot:set-cookie "uid"
+                                       :expires (local-time:timestamp-to-universal
+                                                 (local-time:unix-to-timestamp
+                                                  (+ (* 60 60 600)
+                                                     (local-time:timestamp-to-unix
+                                                      (local-time:now))))) 
+                                       :value (gethash "uid" person))
+               (hunchentoot:redirect "https://downvote.ivy.io/"))
+        
+        (with-login-page
+            (:div :class "am-wrapper am-login"
+              (:div :class "am-content"
+                (:div :class "main-content"
+                  (:div :class "login-container"
+                    (:div :class "panel panel-default"
+                      (:div :style "color:white;" :class "panel-body"
+                        (:span "Incorrect username or password."))))))
+              (:script
+                (ps:ps
+                  (with-document-ready
+                      (lambda ()
+                        (set-timeout
+                         (lambda ()
+                           (setf (@ window location) "/"))
+                         4000))))))))))
 
-(defroute hide-link ("/link/hide/:id") ()
-  (with-session ()
-    (when-let ((the-link (couch-query (list (cons "id" id)
-                                            (cons "type" "link"))
-                                      :limit 1)))
-      (map nil (lambda (link)
-                 (setf (gethash "suphidden" link) t)
-                 (doc-put "reddit" (to-json link)))
-           (remove-if-not (lambda (x)
-                            (string= "link" (hash-get x (list "type"))))
-                          the-link))))
-  "ok")
-
-(defroute favorite-link ("/link/favorite/:id") ()
-  (with-session ()
-    (when-let ((the-link (car (couch-query (list (cons "id" id)
-                                                 (cons "type" "link"))))))
-      (if-let ((is-hidden-already (gethash "suphidden" the-link nil)))
-        ;; The link is being hidden from /favorites and not /links
-        ;; So send it back into the viewable pile.
-        (progn
-          (remhash "favorite" the-link)
-          (remhash "suphidden" the-link)
-          (doc-put "reddit" (to-json the-link)))
-        (progn
-          (setf (gethash "favorite" the-link) 't)
-          (setf (gethash "suphidden" the-link) 't)
-          (doc-put "reddit" (to-json the-link)))))))
-
-(defroute render-comment ("/r/comment/:id") ()
-  (declare (optimize (speed 3) (debug 0) (safety 1)))
-  (with-session ()
-    (let ((comments (couch-query (list (cons "type" "comment")
-                                       (cons "id" id)))))
-      (with-html-string
-        (display-comment (car comments))))))
-
-(defroute favorites ("/favorites") ()
-  (with-session ()
-    (display-links (couch-query (list (cons "type" "link")
-                                      (cons "favorite" 't))
-                                :sort (list (alist-hash-table
-                                             (list (cons "created" "desc"))))
-                                :limit 10000))))
-
-(defun display-links (links)
-  (with-page ()
-    (:div :class "row"
-      (:div :class "col-md-12"
-        (:form :method :post :action "/search"
-          (:div :class "col-md-2"
-            (:div :class "btn-group btn-space"
-              (:a :class "btn btn-default btn-xs" :type "button" :href "/favorites" "Favorites")
-              (:a :class "btn btn-default btn-xs" :type "button" :href "/" "Index")
-              (:input :name "pattern" :type "text" :class "input-xs form-control pull-left" :placeholder "Search..." :id "searchtext"))))
-        (:div :class "col-md-10"
-          (:div :class "btn-group btn-space"
-            (map 'nil (lambda (subreddit)
-                        (:a :class "btn btn-primary btn-xs" :href (format nil "/subreddit/~a" (gethash "name" subreddit)) (gethash "display_name" subreddit)))
-                 (couch-query (list (cons "type" "subreddit"))))))))
-    (map nil #'display-link links)))
-
-(defroute links ("/links") ()
-  (with-session ()
-    (display-links
-     (couch-query (list (cons "type" "link")
-                        (cons "suphidden" (alist-hash-table
-                                           (list (cons "$exists" 'yason:false)))))
-                  :sort (list (alist-hash-table
-                               (list (cons "created" "asc"))))
-                  :limit 600
-                  :fields (list "_id")))))
-
-(defroute index ("/") ()
-  (with-session ()
-    (hunchentoot:redirect "/links")))
-
-(defun scan-for-duplicates ()
-  (map nil
-       (lambda (subreddit)
-         (let ((name (gethash "display_name" subreddit)))
-           (log:info name))
-         (let ((ids (couch-query (list (cons "type" "link")
-                                       (cons "subreddit" (gethash "display_name" subreddit)))
-                                 :fields (list "id")
-                                 :limit 500000)))
-           (map nil
-                (lambda (ids)
-                  (let ((dupes (couch-query (list (cons "type" "link")
-                                                  (cons "id" (gethash "id" ids))))))
-                    (when (< 1 (length dupes))
-                      (map nil (lambda (bye)
-                                 (doc-delete "reddit" (gethash "_id" bye) (gethash "_rev" bye)))
-                           (cdr dupes))
-                      (let ((good (gethash "id" (car dupes))))
-                        (log:info "purged" good)))))
-                ids)))
-       (get-db-subreddits)))
-
-(defroute display-single-link ("/link/:id") ()
-  (let ((link (car (couch-query (list (cons "type" "link")
-                                      (cons "id" id))))))
-    (with-page ()
-      (display-link link))))
-
-(defroute link-search ("/search" :method :post) (pattern)
-  (display-links (find-links-by-pattern pattern)))
-
-(defroute display-subreddit ("/subreddit/:subid") ()
-  (display-links (couch-query (list (cons "type" "link")
-                                    (cons "subreddit_id" subid))
-                              :sort (list (alist-hash-table
-                                           (list (cons "created" "desc"))))
-                              :limit 1000)))
