@@ -19,5 +19,6 @@
                :split-sequence
                :cl-hash-util
                :cl-mango
+               :cl-feedparser
                :safe-queue)
   :components ((:file "sup")))

@@ -22,7 +22,7 @@
   (setf cl-mango:*port* 5984)
   (setf cl-mango:*scheme* :http)
   (setf cl-mango:*username* "admin")
-  (setf cl-mango:*password* "3113nsburg")
+  (setf cl-mango:*password* "h4r01d")
 
   (defparameter *client-id* "NgPcSAMcznk3aQ")
   (defparameter *client-secret* "nZZdcddz-BbYEVwpwkhiGOjzRoQ"))
@@ -636,13 +636,6 @@
 
 
 
-
-
-
-
-
-
-
 (defroute ui/login ("/login" :method :get) ()
   (with-page (:body-class "am-splash-screen")
     (:div :class "am-wrapper am-login"
@@ -714,7 +707,8 @@
 
 (defroute links ("/links") ()
   (with-session ()
-    (display-links (hash-extract "id" (cl-mango:query-view "reddit" "tests" "links")))))
+    (display-links (hash-extract "id"
+                                 (cl-mango:query-view "reddit" "tests" "links")))))
 
 (defroute index ("/") ()
   (with-session ()
@@ -867,4 +861,3 @@
                          (lambda ()
                            (setf (@ window location) "/"))
                          4000))))))))))
-
