@@ -386,7 +386,8 @@
           (progn
             (setf (gethash "_id" new-link) id)
             (setf (gethash "_rev" new-link) revision))
-          (setf (gethash "_id" new-link) (make-id new-link)))
+          (progn
+            (setf (gethash "_id" new-link) (make-id new-link))))
       (handler-case
           (progn
             (cl-mango:doc-put "reddit" (to-json new-link))
@@ -452,14 +453,23 @@
                     (loop
                       (authenticate)
                       (sync-subreddits)
-                      (scan-links)
-                      (scan-comments)
+                      (scan-links)))
+                  :name "link fetcher")
+  (bt:make-thread (lambda ()
+                    (loop
+                      (scan-comments)))
+                  :name "comment fetcher")
+  (bt:make-thread (lambda ()
+                    (loop
                       (update-feeds)
-                      (sleep (* 5 60))))
-                  :name "sup post fetcher"))
+                      (sleep 60)))
+                  :name "RSS fetcher"))
 
 (defun stop-refresh-threads ()
-  (cl-ivy:stop-thread-by-name "sup post fetcher"))
+  (cl-ivy:stop-thread-by-name "link fetcher")
+  (cl-ivy:stop-thread-by-name "comment fetcher")
+  (cl-ivy:stop-thread-by-name "RSS fetcher"))
+
 
 (defun mark-subreddit-as-read (subreddit)
   (let ((posts (couch-query (list (cons "subreddit" subreddit)
@@ -707,8 +717,11 @@
 
 (defroute links ("/links") ()
   (with-session ()
-    (display-links (hash-extract "id"
-                                 (cl-mango:query-view "reddit" "tests" "links")))))
+    (display-links
+     (hash-extract "id"
+                   (cl-mango:query-view "reddit" "tests" "links"
+                                        :parameters (list (cons "descending" (with-output-to-string (sink)
+                                                                               (yason:encode 'yason:true sink)))))))))
 
 (defroute index ("/") ()
   (with-session ()
