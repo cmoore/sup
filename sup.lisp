@@ -458,18 +458,12 @@
   (bt:make-thread (lambda ()
                     (loop
                       (scan-comments)))
-                  :name "comment fetcher")
-  (bt:make-thread (lambda ()
-                    (loop
-                      (update-feeds)
-                      (sleep 60)))
-                  :name "RSS fetcher"))
+                  :name "comment fetcher"))
 
 (defun stop-refresh-threads ()
   (cl-ivy:stop-thread-by-name "link fetcher")
   (cl-ivy:stop-thread-by-name "comment fetcher")
   (cl-ivy:stop-thread-by-name "RSS fetcher"))
-
 
 (defun mark-subreddit-as-read (subreddit)
   (let ((posts (couch-query (list (cons "subreddit" subreddit)
@@ -553,9 +547,12 @@
                            :href url (html-entities:decode-entities title))
                          title)
                        (:br)
-                       (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
-                         :href (format nil "https://www.reddit.com~a" (gethash "permalink" doc-hash))
-                         (gethash "subreddit" doc-hash)))
+                       (:span  (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
+                              :href (format nil "https://www.reddit.com~a" (gethash "permalink" doc-hash))
+                              (format nil "~a in ~a"
+                                      (gethash "author" doc-hash)
+                                      (gethash "subreddit" doc-hash)))))
+                     
                      (:script
                        (ps:ps*
                         `(with-document-ready
@@ -617,8 +614,13 @@
         (:div :class "col-md-10"
           (:div :class "btn-group btn-space"
             (map 'nil (lambda (subreddit)
-                        (:a :class "btn btn-primary btn-xs" :href (format nil "/subreddit/~a" (gethash "name" subreddit)) (gethash "display_name" subreddit)))
-                 (couch-query (list (cons "type" "subreddit"))))))))
+                        (:a :class "btn btn-primary btn-xs"
+                          :href (format nil "/subreddit/~a" (gethash "name" subreddit))
+                          (gethash "display_name" subreddit)))
+                 (sort (couch-query (list (cons "type" "subreddit")))
+                       #'string<
+                       :key (lambda (x)
+                              (string-upcase (gethash "display_name" x)))))))))
     (map nil #'display-link link-ids)))
 
 (defun scan-for-duplicates ()
@@ -874,3 +876,79 @@
                          (lambda ()
                            (setf (@ window location) "/"))
                          4000))))))))))
+
+(setf lparallel:*kernel* (lparallel:make-kernel 10))
+
+(defun purge-links (links)
+  (lparallel:pmapcar (lambda (link)
+                       (let ((comments (couch-query (list (cons "link_id" (format nil "t3_~a"
+                                                                                  (gethash "id" link))))
+                                                    :limit 20000)))
+                         (when (< 0 (length comments))
+                           (log:info "comments: ~a" (length comments))
+                           (lparallel:pmapcar (lambda (comment)
+                                                (handler-case 
+                                                    (doc-delete "reddit"
+                                                                (gethash "_id" comment)
+                                                                (gethash "_rev" comment))
+                                                  (cl-mango:unexpected-http-response (condition)
+                                                    (log:info "delete gave an error. ~a ~a"
+                                                              (cl-mango::status-body condition)
+                                                              (cl-mango::status-code condition))
+                                                    nil)))
+                                              comments))
+                         (handler-case
+                             (doc-delete "reddit"
+                                         (gethash "_id" link)
+                                         (gethash "_rev" link))
+                           (cl-mango:unexpected-http-response (condition)
+                             (log:info "delete gave an error. ~a ~a"
+                                       (cl-mango::status-body condition)
+                                       (cl-mango::status-code condition))
+                             nil))))
+                     links))
+
+(defun purge-subreddit (subreddit-name)
+  (let ((links (couch-query (list (cons "subreddit" subreddit-name))
+                            :limit 1000)))
+    (log:info "links: ~a" (length links))
+    
+    (when (= 0 (length links))
+      (return-from purge-subreddit))
+
+    (purge-links links)
+
+    (purge-subreddit subreddit-name)))
+
+(defun find-orphaned-links ()
+  (let ((links (couch-query (list (cons "type" "link"))
+                            :fields (list "_id" "_rev" "subreddit")
+                            :limit 100000))
+        (subreddit-names (mapcar (lambda (x)
+                                   (gethash "display_name" x))
+                                 (couch-query (list (cons "type" "subreddit"))
+                                              :fields (list "display_name")))))
+    (lparallel:pmap 'nil
+                    (lambda (link)
+                      (unless (member (gethash "subreddit" link)
+                                      subreddit-names
+                                      :test #'string=)
+                        (purge-links (list link))))
+                    links)))
+
+(defun remove-orphaned-links ()
+  (let ((link-subs (sort (remove-duplicates
+                          (mapcar (lambda (x)
+                                    (gethash "subreddit" x))
+                                  (couch-query (list (cons "type" "link"))
+                                               :fields (list "subreddit")
+                                               :limit 100000)) :test #'string=)
+                         #'string<))
+        (db-subs (sort (mapcar (lambda (x)
+                                 (gethash "display_name" x))
+                               (get-db-subreddits))
+                       #'string<)))
+    (remove-if-not (lambda (x)
+                     (member x db-subs))
+                   link-subs)))
+
