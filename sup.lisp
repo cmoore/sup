@@ -24,6 +24,7 @@
   (setf cl-mango:*username* "admin")
   (setf cl-mango:*password* "h4r01d")
 
+  (setf lparallel:*kernel* (lparallel:make-kernel 10 :name "suckit"))
   (defparameter *client-id* "NgPcSAMcznk3aQ")
   (defparameter *client-secret* "nZZdcddz-BbYEVwpwkhiGOjzRoQ"))
 
@@ -453,11 +454,13 @@
                     (loop
                       (authenticate)
                       (sync-subreddits)
-                      (scan-links)))
+                      (scan-links)
+                      (sleep 60)))
                   :name "link fetcher")
   (bt:make-thread (lambda ()
                     (loop
-                      (scan-comments)))
+                      (scan-comments)
+                      (sleep 60)))
                   :name "comment fetcher"))
 
 (defun stop-refresh-threads ()
@@ -879,34 +882,32 @@
 
 (setf lparallel:*kernel* (lparallel:make-kernel 10))
 
-(defun purge-links (links)
-  (lparallel:pmapcar (lambda (link)
-                       (let ((comments (couch-query (list (cons "link_id" (format nil "t3_~a"
-                                                                                  (gethash "id" link))))
-                                                    :limit 20000)))
-                         (when (< 0 (length comments))
-                           (log:info "comments: ~a" (length comments))
-                           (lparallel:pmapcar (lambda (comment)
-                                                (handler-case 
-                                                    (doc-delete "reddit"
-                                                                (gethash "_id" comment)
-                                                                (gethash "_rev" comment))
-                                                  (cl-mango:unexpected-http-response (condition)
-                                                    (log:info "delete gave an error. ~a ~a"
-                                                              (cl-mango::status-body condition)
-                                                              (cl-mango::status-code condition))
-                                                    nil)))
-                                              comments))
-                         (handler-case
-                             (doc-delete "reddit"
-                                         (gethash "_id" link)
-                                         (gethash "_rev" link))
-                           (cl-mango:unexpected-http-response (condition)
-                             (log:info "delete gave an error. ~a ~a"
-                                       (cl-mango::status-body condition)
-                                       (cl-mango::status-code condition))
-                             nil))))
-                     links))
+(defun purge-link (link)
+  (let ((comments (couch-query (list (cons "link_id" (format nil "t3_~a"
+                                                             (gethash "id" link))))
+                               :limit 20000)))
+    (when (< 0 (length comments))
+      (log:info "comments: ~a" (length comments))
+      (lparallel:pmapcar (lambda (comment)
+                           (handler-case 
+                               (doc-delete "reddit"
+                                           (gethash "_id" comment)
+                                           (gethash "_rev" comment))
+                             (cl-mango:unexpected-http-response (condition)
+                               (log:info "delete gave an error. ~a ~a"
+                                         (cl-mango::status-body condition)
+                                         (cl-mango::status-code condition))
+                               nil)))
+                         comments))
+    (handler-case
+        (doc-delete "reddit"
+                    (gethash "_id" link)
+                    (gethash "_rev" link))
+      (cl-mango:unexpected-http-response (condition)
+        (log:info "delete gave an error. ~a ~a"
+                  (cl-mango::status-body condition)
+                  (cl-mango::status-code condition))
+        nil))))
 
 (defun purge-subreddit (subreddit-name)
   (let ((links (couch-query (list (cons "subreddit" subreddit-name))
@@ -928,27 +929,15 @@
                                    (gethash "display_name" x))
                                  (couch-query (list (cons "type" "subreddit"))
                                               :fields (list "display_name")))))
-    (lparallel:pmap 'nil
-                    (lambda (link)
-                      (unless (member (gethash "subreddit" link)
-                                      subreddit-names
-                                      :test #'string=)
-                        (purge-links (list link))))
-                    links)))
+    (remove-if-not #'(lambda (link)
+                       (member (gethash "subreddit" link)
+                               subreddit-names
+                               :test #'string=)) links)))
 
 (defun remove-orphaned-links ()
-  (let ((link-subs (sort (remove-duplicates
-                          (mapcar (lambda (x)
-                                    (gethash "subreddit" x))
-                                  (couch-query (list (cons "type" "link"))
-                                               :fields (list "subreddit")
-                                               :limit 100000)) :test #'string=)
-                         #'string<))
-        (db-subs (sort (mapcar (lambda (x)
-                                 (gethash "display_name" x))
-                               (get-db-subreddits))
-                       #'string<)))
-    (remove-if-not (lambda (x)
-                     (member x db-subs))
-                   link-subs)))
+  (map 'nil #'purge-link (find-orphaned-links)))
 
+(defun mark-everything-read ()
+  (mapcar (lambda (subreddit-hash)
+            (mark-subreddit-as-read (gethash "display_name" subreddit-hash)))
+          (get-db-subreddits)))
