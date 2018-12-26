@@ -20,5 +20,6 @@
                :cl-hash-util
                :cl-mango
                :cl-feedparser
-               :safe-queue)
+               :safe-queue
+               :swank)
   :components ((:file "sup")))

@@ -8,12 +8,14 @@
         #:spinneret
         #:cl-mango
         #:cl-hash-util)
+  
   (:import-from :alexandria
                 when-let
                 when-let*
                 if-let
                 if-let
                 alist-hash-table))
+
 
 (in-package #:sup)
 
@@ -24,11 +26,23 @@
   (setf cl-mango:*username* "admin")
   (setf cl-mango:*password* "h4r01d")
 
-  (setf lparallel:*kernel* (lparallel:make-kernel 10 :name "suckit"))
   (defparameter *client-id* "NgPcSAMcznk3aQ")
   (defparameter *client-secret* "nZZdcddz-BbYEVwpwkhiGOjzRoQ"))
 
 (defparameter *reddit-user* nil)
+
+(defparameter *listener* nil)
+(defparameter *person* nil)
+
+(defun save-world ()
+  (ccl:save-application "sup.world"
+                        :purify t
+                        :prepend-kernel t))
+
+(defun application-start ()
+  (swank:create-server :port 5000 :dont-close t)
+  (start-server)
+  (loop (sleep 10)))
 
 (defclass access-token ()
   ((access-token :accessor access-token-access-token
@@ -84,8 +98,6 @@
                  (stringp the-type)))
     (format nil "~a:~a" the-reddit-id the-type)))
 
-(defparameter *listener* nil)
-
 (defun start-server (&key (port 8086))
   (unless *listener*
     (setf *listener* (make-instance 'easy-routes:easy-routes-acceptor
@@ -133,8 +145,6 @@
   `(do ((i 0 (incf i)))
        ((>= i (@ ,list length)))
      (funcall ,func (aref ,list i))))
-
-(defparameter *person* nil)
 
 (defmacro with-session ((&key (require-user t)) &body body)
   (alexandria:with-gensyms (this-person)
@@ -397,15 +407,16 @@
           (declare (ignore condition))
           nil)))))
 
+(defun update-subreddit (subreddit)
+  (unless (ppcre:scan "u_" (gethash "display_name" subreddit))
+    (let ((latest-id (get-latest-post-id-for-subreddit
+                      (gethash "display_name" subreddit))))
+      (map nil #'handle-possible-new-link
+           (hash-extract "data"
+                         (get-subreddit-links subreddit :latest-id (or latest-id 0)))))))
 (defun scan-links ()
   (log:info "links")
-  (map nil (lambda (subreddit)
-             (unless (ppcre:scan "u_" (gethash "display_name" subreddit))
-               (let ((latest-id (get-latest-post-id-for-subreddit
-                                 (gethash "display_name" subreddit))))
-                 (map nil #'handle-possible-new-link
-                      (hash-extract "data"
-                                    (get-subreddit-links subreddit :latest-id (or latest-id 0)))))))
+  (map nil #'update-subreddit
        (couch-query (list (cons "type" "subreddit")))))
 
 (defun find-links-by-pattern (pattern)
@@ -455,18 +466,12 @@
                       (authenticate)
                       (sync-subreddits)
                       (scan-links)
-                      (sleep 60)))
-                  :name "link fetcher")
-  (bt:make-thread (lambda ()
-                    (loop
                       (scan-comments)
                       (sleep 60)))
-                  :name "comment fetcher"))
+                  :name "fetchers"))
 
 (defun stop-refresh-threads ()
-  (cl-ivy:stop-thread-by-name "link fetcher")
-  (cl-ivy:stop-thread-by-name "comment fetcher")
-  (cl-ivy:stop-thread-by-name "RSS fetcher"))
+  (cl-ivy:stop-thread-by-name "fetchers"))
 
 (defun mark-subreddit-as-read (subreddit)
   (let ((posts (couch-query (list (cons "subreddit" subreddit)
@@ -604,6 +609,25 @@
                     (:div.panel-body :id (format nil "comments-~a" (gethash "id" doc-hash))
                                      :style "display:none;"))))))))
 
+(defroute stop-threads ("/stop-fetchers") ()
+  (stop-refresh-threads)
+  (hunchentoot:redirect "/links"))
+
+(defroute start-threads ("/start-fetchers") ()
+  (start-refresh-threads)
+  (hunchentoot:redirect "/links"))
+
+(defun fetcher-is-running-p ()
+  (member "fetchers" (mapcar #'bt:thread-name
+                             (bt:all-threads))
+          :test #'string=))
+
+(defun ws-javascript ()
+  (ps:ps
+    
+    )
+  )
+
 (defun display-links (link-ids)
   (with-page ()
     (:div :class "row"
@@ -611,9 +635,21 @@
         (:form :method :post :action "/search"
           (:div :class "col-md-2"
             (:div :class "btn-group btn-space"
-              (:a :class "btn btn-default btn-xs" :type "button" :href "/favorites" "Favorites")
-              (:a :class "btn btn-default btn-xs" :type "button" :href "/" "Index")
-              (:input :name "pattern" :type "text" :class "input-xs form-control pull-left" :placeholder "Search..." :id "searchtext"))))
+              (:a :class "btn btn-default btn-xs"
+                :type "button" :href "/favorites" "Favorites")
+              (:a :class "btn btn-default btn-xs"
+                :type "button" :href "/links" "Index")
+              
+              (if (fetcher-is-running-p)
+                (:a :class "btn btn-primary btn-xs"
+                  :style "margin-left:10px;"
+                  :type "button" :href "/stop-fetchers" "Stop Collector")
+                (:a :class "btn btn-default btn-xs"
+                  :style "margin-left:10px;"
+                  :type "button" :href "/start-fetchers" "Start Collectors"))
+              
+              (:input :name "pattern" :type "text"
+                :class "input-xs form-control pull-left" :placeholder "Search..." :id "searchtext"))))
         (:div :class "col-md-10"
           (:div :class "btn-group btn-space"
             (map 'nil (lambda (subreddit)
@@ -648,7 +684,65 @@
                 ids)))
        (get-db-subreddits)))
 
+(defun purge-link (link)
+  (let ((comments (couch-query (list (cons "link_id" (format nil "t3_~a"
+                                                             (gethash "id" link))))
+                               :limit 20000)))
+    (when (< 0 (length comments))
+      (log:info "comments: ~a" (length comments))
+      (mapcar (lambda (comment)
+                (handler-case 
+                    (doc-delete "reddit"
+                                (gethash "_id" comment)
+                                (gethash "_rev" comment))
+                  (cl-mango:unexpected-http-response (condition)
+                    (log:info "delete gave an error. ~a ~a"
+                              (cl-mango::status-body condition)
+                              (cl-mango::status-code condition))
+                    nil)))
+              comments))
+    (handler-case
+        (doc-delete "reddit"
+                    (gethash "_id" link)
+                    (gethash "_rev" link))
+      (cl-mango:unexpected-http-response (condition)
+        (log:info "delete gave an error. ~a ~a"
+                  (cl-mango::status-body condition)
+                  (cl-mango::status-code condition))
+        nil))))
 
+(defun purge-subreddit (subreddit-name)
+  (let ((links (couch-query (list (cons "subreddit" subreddit-name))
+                            :limit 1000)))
+    (log:info "links: ~a" (length links))
+    
+    (when (= 0 (length links))
+      (return-from purge-subreddit))
+
+    (mapcar #'purge-link links)
+
+    (purge-subreddit subreddit-name)))
+
+(defun find-orphaned-links ()
+  (let ((links (couch-query (list (cons "type" "link"))
+                            :fields (list "_id" "_rev" "subreddit")
+                            :limit 100000))
+        (subreddit-names (mapcar (lambda (x)
+                                   (gethash "display_name" x))
+                                 (couch-query (list (cons "type" "subreddit"))
+                                              :fields (list "display_name")))))
+    (remove-if #'(lambda (link)
+                   (member (gethash "subreddit" link) subreddit-names
+                           :test #'string=))
+               links)))
+
+(defun remove-orphaned-links ()
+  (map 'nil #'purge-link (find-orphaned-links)))
+
+(defun mark-everything-read ()
+  (mapcar (lambda (subreddit-hash)
+            (mark-subreddit-as-read (gethash "display_name" subreddit-hash)))
+          (get-db-subreddits)))
 
 
 (defroute ui/login ("/login" :method :get) ()
@@ -850,94 +944,90 @@
 
 (defroute ui/login-post ("/login" :method :post) (email password)
   (if (not (< 3 (length email)))
-      (redirect "https://downvote.ivy.io/login")
-      (alexandria:if-let ((person (car (couch-query (list (cons "type" "person")
-                                                          (cons "email" email)
-                                                          (cons "password" (make-hash password)))))))
-        (progn (hunchentoot:set-cookie "uid"
-                                       :expires (local-time:timestamp-to-universal
-                                                 (local-time:unix-to-timestamp
-                                                  (+ (* 60 60 600)
-                                                     (local-time:timestamp-to-unix
-                                                      (local-time:now))))) 
-                                       :value (gethash "uid" person))
-               (hunchentoot:redirect "https://downvote.ivy.io/"))
-        
-        (with-login-page
-            (:div :class "am-wrapper am-login"
-              (:div :class "am-content"
-                (:div :class "main-content"
-                  (:div :class "login-container"
-                    (:div :class "panel panel-default"
-                      (:div :style "color:white;" :class "panel-body"
-                        (:span "Incorrect username or password."))))))
-              (:script
-                (ps:ps
-                  (with-document-ready
-                      (lambda ()
-                        (set-timeout
-                         (lambda ()
-                           (setf (@ window location) "/"))
-                         4000))))))))))
+    (redirect "https://downvote.ivy.io/login")
+    (alexandria:if-let ((person (car (couch-query (list (cons "type" "person")
+                                                        (cons "email" email)
+                                                        (cons "password" (make-hash password)))))))
+      (progn (hunchentoot:set-cookie "uid"
+                                     :expires (local-time:timestamp-to-universal
+                                               (local-time:unix-to-timestamp
+                                                (+ (* 60 60 600)
+                                                   (local-time:timestamp-to-unix
+                                                    (local-time:now))))) 
+                                     :value (gethash "uid" person))
+             (hunchentoot:redirect "https://downvote.ivy.io/"))
+      
+      (with-login-page
+          (:div :class "am-wrapper am-login"
+            (:div :class "am-content"
+              (:div :class "main-content"
+                (:div :class "login-container"
+                  (:div :class "panel panel-default"
+                    (:div :style "color:white;" :class "panel-body"
+                      (:span "Incorrect username or password."))))))
+            (:script
+              (ps:ps
+                (with-document-ready
+                    (lambda ()
+                      (set-timeout
+                       (lambda ()
+                         (setf (@ window location) "/"))
+                       4000))))))))))
 
-(setf lparallel:*kernel* (lparallel:make-kernel 10))
 
-(defun purge-link (link)
-  (let ((comments (couch-query (list (cons "link_id" (format nil "t3_~a"
-                                                             (gethash "id" link))))
-                               :limit 20000)))
-    (when (< 0 (length comments))
-      (log:info "comments: ~a" (length comments))
-      (lparallel:pmapcar (lambda (comment)
-                           (handler-case 
-                               (doc-delete "reddit"
-                                           (gethash "_id" comment)
-                                           (gethash "_rev" comment))
-                             (cl-mango:unexpected-http-response (condition)
-                               (log:info "delete gave an error. ~a ~a"
-                                         (cl-mango::status-body condition)
-                                         (cl-mango::status-code condition))
-                               nil)))
-                         comments))
-    (handler-case
-        (doc-delete "reddit"
-                    (gethash "_id" link)
-                    (gethash "_rev" link))
-      (cl-mango:unexpected-http-response (condition)
-        (log:info "delete gave an error. ~a ~a"
-                  (cl-mango::status-body condition)
-                  (cl-mango::status-code condition))
-        nil))))
 
-(defun purge-subreddit (subreddit-name)
-  (let ((links (couch-query (list (cons "subreddit" subreddit-name))
-                            :limit 1000)))
-    (log:info "links: ~a" (length links))
-    
-    (when (= 0 (length links))
-      (return-from purge-subreddit))
 
-    (purge-links links)
 
-    (purge-subreddit subreddit-name)))
 
-(defun find-orphaned-links ()
-  (let ((links (couch-query (list (cons "type" "link"))
-                            :fields (list "_id" "_rev" "subreddit")
-                            :limit 100000))
-        (subreddit-names (mapcar (lambda (x)
-                                   (gethash "display_name" x))
-                                 (couch-query (list (cons "type" "subreddit"))
-                                              :fields (list "display_name")))))
-    (remove-if-not #'(lambda (link)
-                       (member (gethash "subreddit" link)
-                               subreddit-names
-                               :test #'string=)) links)))
 
-(defun remove-orphaned-links ()
-  (map 'nil #'purge-link (find-orphaned-links)))
 
-(defun mark-everything-read ()
-  (mapcar (lambda (subreddit-hash)
-            (mark-subreddit-as-read (gethash "display_name" subreddit-hash)))
-          (get-db-subreddits)))
+
+
+;; (defclass wsaction ()
+;;   ((command :initarg :command
+;;             :reader wsaction-command
+;;             :json-key "command"
+;;             :json-type :string)
+;;    (arguments :initarg :arguments
+;;               :initform ""
+;;               :reader wsaction-arguments
+;;               :json-key "arguments"
+;;               :json-type :string))
+;;   (:metaclass json-mop:json-serializable-class))
+
+;; (defun wsaction-to-json (action)
+;;   (with-output-to-string (sink)
+;;     (json-mop:encode action sink)))
+
+;; (defclass chat-room (hunchensocket:websocket-resource)
+;;   ((name :initarg :name :initform (error "Name this room!") :reader name))
+;;   (:default-initargs :client-class 'user))
+
+;; (defclass user (hunchensocket:websocket-client)
+;;   ((name :initarg :user-agent :reader name :initform (error "Name this user!"))))
+
+;; (defvar *chat-rooms* (list (make-instance 'chat-room :name "/ws/global")))
+
+;; (defun find-room (request)
+;;   (find (hunchentoot:script-name request) *chat-rooms* :test #'string= :key #'name))
+
+;; (pushnew 'find-room hunchensocket:*websocket-dispatch-table*)
+
+;; (defun broadcast (room message &rest args)
+;;   (declare (optimize (debug 0) (speed 3)))
+;;   (dolist (peer (hunchensocket:clients room))
+;;     (hunchensocket:send-text-message peer (apply #'format nil message args))))
+
+;; (defmethod hunchensocket:client-connected ((room chat-room) user)
+;;   (log:info "client connected"))
+
+;; (defmethod hunchensocket:client-disconnected ((room chat-room) user)
+;;   (log:info "client disconnected"))
+
+;; (defmethod hunchensocket:text-message-received ((room chat-room) user message))
+
+;; (defparameter *ws-server* (make-instance 'hunchensocket:websocket-acceptor :port 8088))
+
+;; (defun start-ws-server ()
+;;   (hunchentoot:start *ws-server*))
+
