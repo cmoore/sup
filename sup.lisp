@@ -24,7 +24,7 @@
   (setf cl-mango:*port* 5984)
   (setf cl-mango:*scheme* :http)
   (setf cl-mango:*username* "admin")
-  (setf cl-mango:*password* "h4r01d")
+  (setf cl-mango:*password* "fl33j0b")
 
   (defparameter *client-id* "NgPcSAMcznk3aQ")
   (defparameter *client-secret* "nZZdcddz-BbYEVwpwkhiGOjzRoQ"))
@@ -32,12 +32,8 @@
 (defparameter *reddit-user* nil)
 
 (defparameter *listener* nil)
-(defparameter *person* nil)
 
-(defun save-world ()
-  (ccl:save-application "sup.world"
-                        :purify t
-                        :prepend-kernel t))
+(defparameter *person* nil)
 
 (defun application-start ()
   (swank:create-server :port 5000 :dont-close t)
@@ -387,10 +383,19 @@
                          (log:info "Restarting.")
                          (get-subreddit-links subreddit :latest-id latest-id)))))))
 
+(defun is-repost-p (link-hash)
+  (or (< 0 (length
+            (couch-query (list (cons "type" "link")
+                               (cons "permalink" (gethash "permalink" link-hash))))))
+      (< 0 (length
+            (couch-query (list (cons "type" "link")
+                               (cons "url" (gethash "url" link-hash))))))))
+
 (defun handle-possible-new-link (new-link)
   (multiple-value-bind (id revision hidden)
       (existing-link-info (gethash "id" new-link))
-    (unless hidden
+    (unless (or hidden
+                (is-repost-p new-link))
       (setf (gethash "type" new-link) "link")
       (setf (gethash "written" new-link) (get-universal-time))
       (if revision
@@ -400,9 +405,7 @@
           (progn
             (setf (gethash "_id" new-link) (make-id new-link))))
       (handler-case
-          (progn
-            (cl-mango:doc-put "reddit" (to-json new-link))
-            (comments-handle-link (gethash "permalink" new-link)))
+          (cl-mango:doc-put "reddit" (to-json new-link))
         (cl-mango:unexpected-http-response (condition)
           (declare (ignore condition))
           nil)))))
@@ -414,6 +417,7 @@
       (map nil #'handle-possible-new-link
            (hash-extract "data"
                          (get-subreddit-links subreddit :latest-id (or latest-id 0)))))))
+
 (defun scan-links ()
   (log:info "links")
   (map nil #'update-subreddit
@@ -466,7 +470,6 @@
                       (authenticate)
                       (sync-subreddits)
                       (scan-links)
-                      (scan-comments)
                       (sleep 60)))
                   :name "fetchers"))
 
@@ -744,7 +747,6 @@
             (mark-subreddit-as-read (gethash "display_name" subreddit-hash)))
           (get-db-subreddits)))
 
-
 (defroute ui/login ("/login" :method :get) ()
   (with-page (:body-class "am-splash-screen")
     (:div :class "am-wrapper am-login"
@@ -819,8 +821,9 @@
     (display-links
      (hash-extract "id"
                    (cl-mango:query-view "reddit" "tests" "links"
-                                        :parameters (list (cons "descending" (with-output-to-string (sink)
-                                                                               (yason:encode 'yason:true sink)))))))))
+                                        :parameters (list (cons "limit" "100")
+                                                          (cons "descending" (with-output-to-string (sink)
+                                                                                  (yason:encode 'yason:true sink)))))))))
 
 (defroute index ("/") ()
   (with-session ()
@@ -865,6 +868,8 @@
 
 (defroute show-comments ("/comments/:id") ()
   (with-session ()
+    (let ((link (car (couch-query (list (cons "id" id))))))
+      (comments-handle-link (gethash "permalink" link)))
     (let ((comments (couch-query
                      (list (cons "type" "comment")
                            (cons "link_id" (format nil "t3_~a" id)))
@@ -1030,4 +1035,23 @@
 
 ;; (defun start-ws-server ()
 ;;   (hunchentoot:start *ws-server*))
+
+
+(defun cleanup ()
+  (let ((now (get-universal-time)))
+    (length
+     (couch-query (list (cons "type" "link")
+                        (cons "written" (alist-hash-table
+                                         (list (cons "$lt" (- now 172800))))))
+                  :limit 1000))))
+
+(defun delete-comments ()
+  (let ((comments (couch-query (list (cons "type" "comment"))
+                               :limit 10000
+                               :fields (list "_id" "_rev"))))
+    (map 'nil
+         (lambda (x)
+           (doc-delete "reddit" (gethash "_id" x) (gethash "_rev" x)))
+         comments)
+    (length comments)))
 
