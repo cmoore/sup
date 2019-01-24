@@ -11,6 +11,8 @@
                :cl-ivy
                :local-time
                :html-entities
+               :hunchentoot
+               :hunchensocket
                :easy-routes
                :parenscript
                :css-lite
@@ -19,7 +21,6 @@
                :split-sequence
                :cl-hash-util
                :cl-mango
-               :cl-feedparser
                :safe-queue
                :swank)
   :components ((:file "sup")))
