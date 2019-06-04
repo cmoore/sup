@@ -22,5 +22,8 @@
                :cl-hash-util
                :cl-mango
                :safe-queue
-               :swank)
+               :mailbox
+               :swank
+
+               :defmodel)
   :components ((:file "sup")))

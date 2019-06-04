@@ -1,0 +1,3 @@
+[submodule "static/am"]
+	path = static/am
+	url = git@github.com:cmoore/am

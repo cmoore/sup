@@ -4,3 +4,6 @@
 (swank:create-server :port 5000 :dont-close t)
 (sup::start-server :port 8087)
 (start-refresh-threads)
+(start-ws-server)
+(start-ws-reader-thread)
+
