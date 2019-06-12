@@ -8,7 +8,8 @@
         #:easy-routes
         #:parenscript
         #:spinneret
-        #:cl-hash-util)
+        #:cl-hash-util
+        #:postmodern)
   (:local-nicknames (:alex :alexandria)))
 
 (in-package #:sup)
@@ -27,24 +28,113 @@
     (setf yason:*parse-json-booleans-as-symbols* t)
     (setf hunchentoot:*catch-errors-p* t)))
 
-(mango:defmango like-cache "reddit"
-  ((link-id :initarg :link-id
-            :json-type :string
-            :json-key "link_id")
-   (ups :initarg :ups
-        :json-type :number
-        :json-key "ups")
-   (created :initarg :created
-            :json-type :number
-            :json-key "created"
-            :initform (get-universal-time))))
-
+(defmacro with-pg (&body body)
+  `(with-connection (list "reddit" "sup" "fl33j0b" "localhost" :pooled-p t)
+     ,@body))
 
 (defparameter *reddit-user* nil)
 
 (defparameter *listener* nil)
 
 (defparameter *mailbox* (mailbox:make-mailbox))
+
+
+;; (defclass link ()
+;;   ((id :initarg :id
+;;        :col-type :text
+;;        :accessor link-id)
+;;    (hidden :initarg :hidden
+;;            :col-type :bool
+;;            :accessor link-hidden)
+;;    (written :initarg :written
+;;             :col-type :bigint
+;;             :accessor link-written)
+;;    (created-utc :initarg :created-utc
+;;                 :col-type :bigint
+;;                 :accessor link-created-utc)
+;;    (url :initarg :url
+;;         :col-type :text
+;;         :accessor link-url)
+;;    (permalink :initarg :permalink
+;;               :col-type :text
+;;               :accessor link-permalink)
+;;    (author :initarg :author
+;;            :col-type :text
+;;            :accessor :link-author)
+;;    (subreddit-id :initarg :subreddit-id
+;;                  :col-type :text
+;;                  :accessor link-subreddit-id)
+;;    (media-only :initarg :media-only
+;;                :col-type :bool
+;;                :accessor link-media-only)
+;;    (score :initarg :score
+;;           :col-type :bigint
+;;           :accessor link-score)
+;;    (title :initarg :title
+;;           :col-type :text
+;;           :accessor link-title)
+;;    (author-fullname :initarg :author-fullname
+;;                     :col-type :text
+;;                     :accessor link-author-fullname)
+;;    (selftext :initarg :selftext
+;;              :col-type :text
+;;              :accessor link-selftext)
+;;    (subreddit :initarg :subreddit
+;;               :col-type :text
+;;               :accessor link-subreddit))
+;;   (:metaclass dao-class)
+;;   (:keys id))
+
+;; (deftable link
+;;   (!dao-def)
+;;   (!unique-index :id))
+
+
+;; (defclass subreddit ()
+;;   ((id :initarg :id
+;;        :col-type :text
+;;        :accessor subreddit-id)
+;;    (display-name :initarg :display-name
+;;                  :col-type :text
+;;                  :accessor subreddit-display-name))
+;;   (:metaclass dao-class)
+;;   (:keys id))
+
+;; (deftable subreddit
+;;   (!dao-def)
+;;   (!unique-index :id))
+
+;; (defun copy-mango-data ()
+;;   (dolist (doc-id (our-couch-query (list (cons "type" "subreddit")
+;;                                          (cons "deleted" (alex:alist-hash-table
+;;                                                           (list (cons "$exists" 'yason:false)))))))
+;;     (let ((doc (yason:parse (mango:doc-get "reddit" (gethash "_id" doc-id)))))
+;;       (with-pg (insert-dao (make-instance 'subreddit
+;;                                           :id (gethash "id" doc)
+;;                                           :display-name (gethash "display_name" doc))))))
+;;   (dolist (doc-id (our-couch-query (list (cons "type" "link")
+;;                                          (cons "deleted" (alex:alist-hash-table
+;;                                                           (list (cons "$exists" 'yason:false)))))
+;;                                    :limit 100000
+;;                                    :fields (list "_id")))
+;;     (let ((doc (yason:parse (mango:doc-get "reddit" (gethash "_id" doc-id)))))
+;;       (with-pg (insert-dao (make-instance 'link
+;;                                           :id (gethash "id" doc)
+;;                                           :hidden (gethash "hidden" doc)
+;;                                           :written (gethash "written" doc)
+;;                                           :created-utc (rationalize (gethash "created_utc" doc))
+;;                                           :url (gethash "url" doc)
+;;                                           :permalink (gethash "permalink" doc)
+;;                                           :author (gethash "author" doc)
+;;                                           :subreddit-id (gethash "subreddit_id" doc)
+;;                                           :media-only (gethash "media_only" doc)
+;;                                           :score (gethash "score" doc)
+;;                                           :title (gethash "title" doc)
+;;                                           :author-fullname (gethash "author_fullname" doc)
+;;                                           :selftext (gethash "selftext" doc)
+;;                                           :subreddit (gethash "subreddit" doc)))))))
+
+
 
 (defmacro view-rows (document view args)
   `(gethash "rows"
@@ -348,12 +438,10 @@
     (log:info "Failed")))
 
 (defun get-subreddit-links (subreddit)
-  (declare (optimize (debug 3) (speed 1)))
   (multiple-value-bind (data code)
       (handler-case
-          (let ((url (format nil "https://www.reddit.com~a.json?limit=100"
+          (let ((url (format nil "https://www.reddit.com~anew.json?limit=100"
                              (gethash "url" subreddit))))
-            ;;(log:info "~a" url)
             (drakma:http-request url))
         (usocket:timeout-error (condition)
           (declare (ignore condition))
@@ -395,63 +483,77 @@
               (gethash "downs" link-info)))))
 
 (defun handle-possible-new-link (new-link)
-  (multiple-value-bind (id revision hidden ups)
-      (existing-link-info (gethash "id" new-link))
-    (unless hidden
-      (if revision
-        (progn
-          (let ((n-ups (gethash "ups" new-link)))
-            (when (not (eql (gethash "ups" new-link)
-                            ups))
-              ;; (log:info "Votes: ~a: ~a/~a ~a/~a"
-              ;;           (gethash "title" new-link)
-              ;;           n-ups ups
-              ;;           n-downs downs)
-              (like-cache-create :ups n-ups
-                                 :link-id (gethash "id" new-link))
-              (mailbox:post-mail (to-json
-                                  (alex:alist-hash-table
-                                   (list (cons "id" (gethash "id" new-link))
-                                         (cons "action" "update-votes")
-                                         (cons "ups" n-ups))))
-                                 *mailbox*)))
-          
-          ;; New copy of an old link, so just update the votes.
-          (setf (gethash "_id" new-link) id)
-          (setf (gethash "_rev" new-link) revision)
-          (setf (gethash "type" new-link) "link")
-          (setf (gethash "written" new-link) (get-universal-time))
-          (handler-case (mango:doc-put "reddit" (to-json new-link))
-            (cl-mango:unexpected-http-response (condition)
-              (log:info "Error saving link: ~a ~a" condition new-link))))
-        (unless (is-repostp new-link)
-          (setf (gethash "type" new-link) "link")
-          (setf (gethash "written" new-link) (get-universal-time))
-          (log:info "~a: ~a"
-                    (hash-get new-link (list "subreddit"))
-                    (gethash "title" new-link))
-          
-          (setf (gethash "_id" new-link) (make-id new-link))
-          
-          (handler-case
-              (progn
-                (cl-mango:doc-put "reddit" (to-json new-link))
-                (mailbox:post-mail (to-json (alex:alist-hash-table
-                                             (list (cons "id" (gethash "_id" new-link))
-                                                   (cons "action" "add-link"))))
-                                   *mailbox*))
-            (cl-mango:unexpected-http-response (condition)
-              (log:info "Error saving link: ~a ~a" condition new-link))))))))
+  (declare (optimize (debug 3) (speed 0) (safety 3)))
+  (labels ((make-new-like-cache (new-link)
+             (mango:doc-put "reddit" (to-json (alex:alist-hash-table
+                                               (list (cons "type" "like-cache")
+                                                     (cons "_id" (format nil "~a:like-cache"
+                                                                         (gethash "id" new-link)))
+                                                     (cons "id" (gethash "id" new-link))
+                                                     (cons "ups" (list (gethash "ups" new-link))))))))
+           (update-like-cache (new-link)
+             (alex:if-let ((t-the-cache (car (our-couch-query
+                                              (list (cons "id" (format nil "~a:like-cache"
+                                                                       (gethash "id" new-link)))
+                                                    (cons "deleted" (alex:alist-hash-table
+                                                                     (list (cons "$exists" 'yason:false)))))))))
+               (progn
+                 (log:info "~a" t-the-cache)
+                 (let ((the-cache (yason:parse t-the-cache)))
+                   (let ((ups (gethash "ups" the-cache)))
+                     (log:info "update existing")
+                     (setf (gethash "ups" the-cache) (append ups (list (gethash "ups" new-link))))
+                     (mango:doc-put "reddit" (to-json the-cache))
+                     (mailbox:post-mail (to-json
+                                         (alex:alist-hash-table
+                                          (list (cons "id" (gethash "id" new-link))
+                                                (cons "action" "update-votes")
+                                                (cons "ups" (gethash "ups" new-link)))))
+                                        *mailbox*))))
+               ;;(make-new-like-cache new-link)
+               )))
+    (multiple-value-bind (id revision hidden)
+        (existing-link-info (gethash "id" new-link))
+      (unless hidden
+        ;;(update-like-cache new-link)
+        (if revision
+          (progn
+            
+            ;; New copy of an old link, so just update the votes.
+            (setf (gethash "_id" new-link) id)
+            (setf (gethash "_rev" new-link) revision)
+            (setf (gethash "type" new-link) "link")
+            (setf (gethash "written" new-link) (get-universal-time))
+            (handler-case (mango:doc-put "reddit" (to-json new-link))
+              (cl-mango:unexpected-http-response (condition)
+                (log:info "Error saving link: ~a ~a" condition new-link))))
+          (unless (is-repostp new-link)
+            (setf (gethash "type" new-link) "link")
+            (setf (gethash "written" new-link) (get-universal-time))
+            (log:info "~a: ~a"
+                      (hash-get new-link (list "subreddit"))
+                      (gethash "title" new-link))
+
+            (setf (gethash "_id" new-link) (make-id new-link))
+            (handler-case
+                (progn
+                  (cl-mango:doc-put "reddit" (to-json new-link))
+                  (mailbox:post-mail (to-json (alex:alist-hash-table
+                                               (list (cons "id" (gethash "id" new-link))
+                                                     (cons "action" "add-link"))))
+                                     *mailbox*))
+              (cl-mango:unexpected-http-response (condition)
+                (log:info "Error saving link: ~a ~a" condition new-link)))))))))
 
 (defun update-subreddit (subreddit)
-  (unless (ppcre:scan "u_" (gethash "display_name" subreddit))
-    (map nil #'handle-possible-new-link
-         (let ((yason:*parse-json-booleans-as-symbols* nil))
-           (hash-extract "data"
-                         (get-subreddit-links subreddit))))))
+  (let ((yason:*parse-json-booleans-as-symbols* nil))
+    (unless (ppcre:scan "u_" (gethash "display_name" subreddit))
+      (dolist (link (hash-extract "data" (get-subreddit-links subreddit)))
+        (handle-possible-new-link link)))))
 
 (defun scan-links ()
   (dolist (subreddit (our-couch-query (list (cons "type" "subreddit"))))
+    (log:info "~a" (gethash "display_name" subreddit))
     (update-subreddit subreddit)))
 
 (defun find-links-by-pattern (pattern)
@@ -484,30 +586,30 @@
 
 (defun stop-refresh-threads ()
   (cl-ivy:stop-thread-by-name "fetchers"))
-;; 410-965-7306
+
 (defun mark-subreddit-as-read (subreddit)
-  (let ((posts (our-couch-query (list (cons "subreddit" subreddit)
-                                      (cons "suphidden" (alex:alist-hash-table
-                                                         (list (cons "$exists" 'yason:false))))
-                                      (cons "type" "link"))
-                                :limit 100000)))
+  (alex:when-let ((posts (our-couch-query
+                          (list (cons "subreddit" subreddit)
+                                (cons "suphidden" (alex:alist-hash-table
+                                                   (list (cons "$exists" 'yason:false))))
+                                (cons "type" "link"))
+                          :limit 100000)))
     (dolist (post posts)
       (setf (gethash "suphidden" post) 't)
       (mango:doc-put "reddit" (to-json post)))
-    (length posts)))
+    (log:info (length posts))))
 
 (defun mark-subreddit-as-unread (subreddit)
-  (let ((posts (our-couch-query (list (cons "subreddit" subreddit)
-                                      (cons "suphidden" (alex:alist-hash-table
-                                                         (list (cons "$exists" 'yason:true))))
-                                      (cons "type" "link"))
-                                :limit 100000)))
-    (map 'nil (lambda (doc-hash)
-                (remhash "suphidden" doc-hash)
-                ;;(setf (gethash "suphidden" doc-hash) 't)
-                (mango:doc-put "reddit" (to-json doc-hash)))
-         posts)
-    (length posts)))
+  (alex:when-let ((posts (our-couch-query
+                          (list (cons "subreddit" subreddit)
+                                (cons "suphidden" (alex:alist-hash-table
+                                                   (list (cons "$exists" 'yason:true))))
+                                (cons "type" "link"))
+                          :limit 100000)))
+    (dolist (post posts)
+      (remhash "suphidden" post)
+      (mango:doc-put "reddit" (to-json post)))
+    (log:info (length posts))))
 
 (defun %ps-load-comments (comment unique-id)
   (with-html
@@ -557,11 +659,11 @@
 (defun display-link (doc-id)
   (labels ((is-nsfw? (doc-hash)
              (eq (hash-get doc-hash '("over_18")) 'yason:true)))
-    (alex:when-let ((doc-hash (yason:parse
-                               (mango:doc-get "reddit" doc-id))))
+    (alex:when-let ((doc-hash (car (our-couch-query (list (cons "type" "link")
+                                                          (cons "id" doc-id))))))
       (with-html
         (let ((unique-id (format nil "~a" (uuid:make-v4-uuid))))
-          (:div :class "col-md-6" :id (format nil "wx~a" unique-id)
+          (:div :class "col-md-4" :id (format nil "wx~a" unique-id)
             (:div :class "row"
               (:div.col-md-12
                (:div.panel.panel-default.panel-borders.panel-heading-fullwidth
@@ -641,7 +743,11 @@
                      `(with-document-ready
                           (lambda ()
                             (-> (sel ,(format nil "#link-~a" unique-id))
-                                (load ,(format nil "/link/body/~a" (gethash "_id" doc-hash)))))))))
+                                (load ,(format nil "/link/body/~a" (gethash "_id" doc-hash))))
+                            (update-graph ,(gethash "id" doc-hash)))))))
+                (:div.panel-body :id (format nil "graph~a" (gethash "id" doc-hash))
+                                 :style "height:30px;margin-bottom:5px;"
+                                 )
                 (:div.panel-body :class "link-body"
                                  :style "padding: 10px 15px 15px;"
                                  :id (format nil "link-~a" unique-id))
@@ -713,7 +819,19 @@
                         #'string<
                         :key (lambda (x)
                                (string-upcase (gethash "display_name" x)))))))))
-     ,@body))
+     ,@body
+     (:script
+       (:raw
+        (ps:ps
+          (defun update-graph (link-id)
+            (-> $ (ajax (create :type "get"
+                                :url (concatenate 'string "/graph/history/" link-id)
+                                :success (lambda (obj)
+                                           (-> (sel (concatenate 'string "#graph" link-id))
+                                               (sparkline obj
+                                                          (create :width "100%"
+                                                                  :height "35"
+                                                                  :line-width 1.7)))))))))))))
 
 (defun display-links (link-ids)
   (links-page
@@ -797,6 +915,10 @@
 (defun remove-orphaned-links ()
   (map 'nil #'purge-link (find-orphaned-links)))
 
+(defun mark-everything-unread ()
+  (dolist (subreddit (hash-extract "display_name" (get-db-subreddits)))
+    (mark-subreddit-as-unread subreddit)))
+
 (defun mark-everything-read ()
   (dolist (subreddit (get-db-subreddits))
     (mark-subreddit-as-read (gethash "display_name" subreddit))))
@@ -817,14 +939,16 @@
   (display-links (find-links-by-pattern pattern)))
 
 (defroute display-subreddit ("/subreddit/:subid") ()
-  (display-links
-   (hash-extract "_id"
-                 (our-couch-query (list (cons "type" "link")
-                                        (cons "subreddit_id" subid))
-                                  :fields (list "_id")
-                                  :sort (list
-                                         (alex:alist-hash-table
-                                          (list (cons "created_utc" "desc"))))))))
+  (let ((links (hash-extract "id"
+                             (our-couch-query (list (cons "type" "link")
+                                                    (cons "subreddit_id" subid))
+                                              :fields (list "id")
+                                              :sort (list
+                                                     (alex:alist-hash-table
+                                                      (list (cons "created_utc" "desc"))))))))
+    (log:info (length links))
+    (log:info (car links))
+    (display-links links)))
 
 (defroute favorites ("/favorites") ()
   (let ((link-ids (hash-extract "id"
@@ -836,7 +960,6 @@
     (display-links link-ids)))
 
 (defroute links ("/links") ()
-  (declare (optimize (debug 3)))
   (display-links
    (hash-extract "id"
                  (gethash "rows"
@@ -876,7 +999,6 @@
         (mango:doc-put "reddit" (to-json the-link))))))
 
 (defroute render-comment ("/r/comment/:id") ()
-  (declare (optimize (speed 3) (debug 0) (safety 1)))
   (let ((comments (our-couch-query (list (cons "type" "comment")
                                          (cons "id" id)))))
     (with-html-string
@@ -989,7 +1111,13 @@
 
 (defroute make-history ("/graph/history/:id") ()
   (setf (hunchentoot:content-type*) "application/json")
-  (to-json (get-revision-history (ppcre:regex-replace-all ":link" id ""))))
+  (alex:if-let ((doc (handler-case (mango:doc-get "reddit"
+                                                  (format nil "~a:like-cache" id))
+                       (mango:unexpected-http-response (condition)
+                         (declare (ignore condition))
+                         nil))))
+    (to-json (gethash "ups" (yason:parse doc)))
+    "[]"))
 
 (defroute make-graph ("/graph/:id") ()
   (with-html-string
@@ -1008,7 +1136,6 @@
       (ps*
        `(progn
           (defvar ws nil)
-          
           (defun ws-connect ()
             (defvar ws nil)
             (setf ws (new (-web-socket "ws://127.0.0.1:8088/ws/news")))
@@ -1032,7 +1159,6 @@
                     (if (string= (@ event data) "ping")
                       (-> ws (send "pong"))
                       (progn
-                        (-> console (log (@ event data)))
                         (let ((env (-> -j-s-o-n (parse (@ event data)))))
                           (when (string= (@ env action) "add-link")
                             (add-link (@ env id)))
@@ -1045,8 +1171,8 @@
                   (new-ups (parse-int (@ env ups))))
               (unless (equal current-ups new-ups)
                 (if (< current-ups new-ups)
-                  (update-graph (concatenate 'string (@ env id) ":link"))
                   (progn
+                    (update-graph (@ env id))
                     (-> (sel (+ "#ups" (@ env id))) (remove-class "text-danger"))
                     (-> (sel (+ "#ups" (@ env id))) (add-class "text-success"))
                     (-> (sel (+ "#ups" (@ env id))) (html (@ env ups))))
@@ -1056,22 +1182,15 @@
                     (-> (sel (+ "#ups" (@ env id))) (html (@ env ups))))))))
 
           (defun update-graph (link-id)
-            (let ((graphid (concatenate 'string "graph" link-id)))
-              (-> console (log graphid)))
             (-> $ (ajax (create :type "get"
                                 :url (concatenate 'string "/graph/history/" link-id)
                                 :success (lambda (obj)
                                            (-> (sel (concatenate 'string "#graph" link-id))
                                                (sparkline obj
                                                           (create :width "100%"
+                                                                  :height "35"
                                                                   :line-width 1.7))))))))
           (defun add-link (link-id)
-            (update-graph link-id)
-            (-> $ (ajax (create :type "get"
-                                :url (concatenate 'string "/graph/" link-id)
-                                :success (lambda (text)
-                                           (-> (sel "#graphs")
-                                               (append text))))))
             (-> $ (ajax (create :type "get"
                                 :url (concatenate 'string "/singlelink/" link-id)
                                 :error (lambda (e)
@@ -1109,16 +1228,13 @@
     (hunchensocket:send-text-message peer (apply #'format nil message args))))
 
 (defun new-articles-to-live ()
-  (dolist (link (hash-extract "id"
-                              (gethash "rows"
-                                       (yason:parse
-                                        (cl-mango:query-view "reddit" "tests" "links"
-                                                             (list (cons "limit" "100")
-                                                                   (cons "descending" "true")))))))
+  (dolist (link (our-couch-query (list (cons "type" "link")
+                                       (cons "suphidden" (alex:alist-hash-table
+                                                          (list (cons "$exists" 'yason:false)))))))
     (mailbox:post-mail (to-json
                         (alex:alist-hash-table
                          (list (cons "action" "add-link")
-                               (cons "id" link))))
+                               (cons "id" (gethash "id" link)))))
                        *mailbox*)))
 
 (defmethod hunchensocket:client-connected ((room chat-room) user)
@@ -1179,8 +1295,20 @@
     (mango:doc-delete "reddit" (gethash "_id" link) (gethash "_rev" link))))
 
 
-(defun get-revision-history (linkid)
-  (hash-extract "ups" (our-couch-query (list (cons "type" "like-cache")
-                                             (cons "link_id" linkid))
-                                       :sort (list (alex:alist-hash-table
-                                                    (list (cons "created" "asc")))))))
+(defun test ()
+  (let ((cache-items (our-couch-query (list (cons "type" "like-cache"))
+                                      :fields (list "_id" "_rev")
+                                      :limit 10000)))
+    (let ((mango:*explain* nil))
+      (mango:bulk-docs "reddit" (to-json
+                                 (alex:alist-hash-table
+                                  (list (cons "docs"
+                                              (mapcar (lambda (doc)
+                                                        (alexandria:alist-hash-table
+                                                         (list (cons "_id" (gethash "_id" doc))
+                                                               (cons "_rev" (gethash "_rev" doc))
+                                                               (cons "deleted" 'yason:true))))
+                                                      cache-items)))))))
+    (when (equalp (length cache-items) 10000)
+      (log:info "cycle")
+      (test))))

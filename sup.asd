@@ -20,10 +20,13 @@
                :spinneret/cl-markdown
                :split-sequence
                :cl-hash-util
-               :cl-mango
                :safe-queue
                :mailbox
-               :swank
 
-               :defmodel)
+               :cl-mango
+               :cl-postgres+local-time
+               :postmodern
+
+               )
+  
   :components ((:file "sup")))
