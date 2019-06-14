@@ -23,10 +23,7 @@
                :safe-queue
                :mailbox
 
-               :cl-mango
                :cl-postgres+local-time
-               :postmodern
-
-               )
+               :postmodern)
   
   :components ((:file "sup")))
