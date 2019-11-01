@@ -25,7 +25,7 @@
     (push (cons "application" "json") drakma:*text-content-types*)))
 
 (defmacro with-pg (&body body)
-  `(with-connection (list "reddit" "cmoore" "h4r01d" "localhost" :pooled-p t)
+  `(with-connection (list "reddit" "cmoore" "fl33j0b" "localhost" :pooled-p t)
        ,@body))
 
 (defun update-subreddits-cache ()
@@ -35,13 +35,31 @@
                                            (:dao subreddit))))
   nil)
 
+
+(defun relabel-links ()
+  (with-pg
+    (dolist (link-id (with-pg (query (:select 'id :from 'link
+                                       :where (:and (:= nil 'shadow))))))
+      (let* ((the-link (get-dao 'link (car link-id)))
+             (link-json (yason:parse (link-bulk the-link))))
+        (alex:when-let ((ltext (gethash "link_flair_text" link-json nil)))
+          (when (not (string= (link-label-text the-link) ltext))
+            (setf (link-label-text the-link) ltext)
+            (alex:when-let ((lb (gethash "link_flair_background_color" link-json nil)))
+              (setf (link-label-background-color the-link) lb))
+            (alex:when-let ((lc (gethash "link_flair_text_color" link-json nil)))
+              (setf (link-label-color the-link) lc))
+            (update-dao the-link)))))))
+
+
+
 (defparameter *reddit-user* nil)
 
 (defparameter *listener* nil)
 
 
 (defparameter *mailbox* (sb-concurrency:make-mailbox :name "New articles mailbox"))
-
+(defparameter *fetchbox* (sb-concurrency:make-mailbox :name "Image fetch box"))
 
 (defclass link ()
   ((id :initarg :id
@@ -100,7 +118,22 @@
    (shadow :initarg :shadow
            :col-type :bool
            :col-default nil
-           :accessor link-shadow))
+           :accessor link-shadow)
+   (store :initarg :static
+           :accessor link-store
+          :col-type (or db-null text))
+   (remotefile :initarg :remotefile
+               :accessor link-remote-file
+               :col-type (or db-null text))
+   (label-text :initarg :label-text
+               :accessor link-label-text
+               :col-type (or db-null text))
+   (label-background-color :initarg :label-background-color
+                           :accessor link-label-background-color
+                           :col-type (or db-null text))
+   (label-color :initarg :label-color
+                :accessor link-label-color
+                :col-type (or db-null text)))
   (:metaclass dao-class)
   (:keys id))
 
@@ -243,34 +276,36 @@
           :json-key "scope"))
   (:metaclass json-serializable-class))
 
+
+(defun raw-get-reddit (url &key (retry nil))
+  (multiple-value-bind (data code)
+      (handler-case
+          (drakma:http-request url
+                               :additional-headers (list
+                                                    (cons "User-Agent" "supyawl:0.2 (by /u/clintm")
+                                                    (cons "X-BULL" "Ferdinand")
+                                                    (cons "X-BULL-FIGHTS" "No, he's a peaceful bull."))
+                               :external-format-in :utf-8
+                               :external-format-out :utf-8)
+        (sb-bsd-sockets:interrupted-error (condition)
+          (log:info "That weird ass interrupted system call error: ~a"
+                    condition)
+          (raw-get-reddit url))
+        (drakma::drakma-simple-error (condition)
+          (log:info "~a" condition)
+          (raw-get-reddit url))
+        (usocket:timeout-error (condition)
+          (log:info "TIMED OUT - retrying: ~a" condition)
+          (raw-get-reddit url)))
+    (alex:switch (code)
+      (200 (values data code))
+      (503 (values nil code))
+      (t (when retry
+           (sleep 1)
+           (raw-get-reddit url))))))
+
 (defun get-reddit (path &key (retry nil))
-  (let ((url (format nil "https://reddit.com~a" path)))
-    (multiple-value-bind (data code)
-        (handler-case
-            (drakma:http-request url
-                                 :additional-headers (list
-                                                      (cons "User-Agent" "supyawl:0.2 (by /u/clintm")
-                                                      (cons "X-BULL" "Ferdinand")
-                                                      (cons "X-BULL-FIGHTS" "No, he's a peaceful bull."))
-                                 :external-format-in :utf-8
-                                 :external-format-out :utf-8)
-          (sb-bsd-sockets:interrupted-error (condition)
-            (log:info "That weird ass interrupted system call error: ~a"
-                      condition)
-            (get-reddit path))
-          (drakma::drakma-simple-error (condition)
-            (log:info "~a" condition)
-            (get-reddit path))
-          (usocket:timeout-error (condition)
-            (log:info "TIMED OUT - retrying: ~a" condition)
-            (get-reddit path)))
-      (alex:switch (code)
-        (200 (values data code))
-        (503 (values nil code))
-        (t (log:info "Error ~a" code)
-           (when retry
-             (sleep 1)
-             (get-reddit path)))))))
+  (raw-get-reddit (format nil "https://reddit.com~a" path) :retry retry))
 
 (defun authenticate ()
   (let ((config (yason:parse (alex:read-file-into-string
@@ -594,9 +629,24 @@
                                             (gethash "id" link-hash)))))
       (progn
         (when update
+          (alex:when-let ((ltext (gethash "link_flair_text" link-hash nil)))
+            (when (not (string= ltext
+                                (link-label-text existing-link)))
+              (setf (link-label-text existing-link) ltext)
+              (alex:when-let ((lb (gethash "link_flair_background_color" link-hash nil)))
+                (setf (link-label-background-color existing-link) lb))
+              (alex:when-let ((lc (gethash "link_flair_text_color" link-hash nil)))
+                (setf (link-label-color existing-link) lc))
+              (unless (link-hidden existing-link)
+                (sb-concurrency:send-message *mailbox*
+                                             (to-json
+                                              (alex:alist-hash-table
+                                               (list (cons "id" (gethash "id" link-hash))
+                                                     (cons "action" "update-link")))))))
+            (with-pg (update-dao existing-link)))
+          (when (link-hidden existing-link)
+            (return-from handle-possible-new-link))
           (update-like-cache))
-        (when (link-hidden existing-link)
-          (return-from handle-possible-new-link))
         (sb-concurrency:send-message *mailbox*
                                      (to-json
                                       (alex:alist-hash-table
@@ -624,7 +674,12 @@
                                        :selftext (gethash "selftext" link-hash)
                                        :subreddit (gethash "subreddit" link-hash)
                                        :bulk (to-json link-hash)
-                                       :body (gethash "selftext_html" link-hash))))
+                                       :body (gethash "selftext_html" link-hash)
+                                       :label-text (gethash "label_flair_text" link-hash nil)
+                                                    
+                                       :label-background-color (gethash "link_flair_background_color" link-hash nil)
+                                       :label-color (gethash "link_flair_text_color"
+                                                             link-hash nil))))
           (add-seen (gethash "id" link-hash))
           (with-pg (insert-dao new-link))
           (when update
@@ -635,13 +690,15 @@
                                                        (cons "action" "add-link")))))
           (send-update-graph new-link))))))
 
+
 (defmethod update-subreddit ((subreddit subreddit))
   (let ((yason:*parse-json-booleans-as-symbols* nil))
     (unless (ppcre:scan "u_" (subreddit-display-name subreddit))
       (dolist (link (hash-extract "data" (get-subreddit-links subreddit)))
         (handle-possible-new-link link))
       (dolist (link (hash-extract "data" (get-subreddit-links subreddit :new t)))
-        (handle-possible-new-link link :update nil)))))
+        (handle-possible-new-link link :update nil))
+      )))
 
 (defun scan-subreddits ()
   (dolist (subreddit (with-pg (select-dao 'subreddit)))
@@ -672,118 +729,132 @@
       (setf (link-hidden link) nil)
       (with-pg (update-dao link)))))
 
-(defmethod display-link ((link link))
+(defgeneric display-link (link &key public))
+
+(defmethod display-link ((link link) &key (public))
   (with-slots (id title url author subreddit created-utc permalink) link
     (with-html
-      (let ((unique-id (format nil "~a" (uuid:make-v4-uuid))))
-        (:div :class "col-md-4" :id (format nil "wx~a" unique-id)
-          
-          (:div.panel.panel-default.panel-borders.panel-heading-fullwidth
-           :style "border:1px solid rgb(7,7,7);"
-           (:div :class "panel-heading" :style "font-size:14px;padding: 15px 15px 10px;"
-             (:div.tools
-              (:div.icon (:a :id (format nil "hider-~a" unique-id)
-                           (:i :class "s7-look")))
-              (:script
-                (ps:ps*
-                 `(-> (sel ,(format nil "#hider-~a" unique-id))
-                      (click (lambda (e)
-                               (-> (sel ,(format nil "#link-~a" unique-id))
-                                   (toggle))
-                               (-> e (prevent-default)))))))
-              (make-author-link link)
-              (:a :style "font-weight:bold;"
-                :target (format nil "win-~a" unique-id)
-                :href (format nil "/link/~a" id)
-                (:div.icon (:span.s7-id)))
-              
-              (:div.icon (:a :id (format nil "shadow-~a" unique-id)
-                           (:i :class "s7-trash")))
-              (:script
-                (ps:ps*
-                 `(-> (sel ,(format nil "#shadow-~a" unique-id))
-                      (click (lambda (e)
-                               (-> (sel ,(format nil "#wx~a" unique-id)) (toggle))
-                               (-> (sel ,(format nil "#wx~a" unique-id)) (load ,(format nil "/shadow/~a" id)))
-                               (-> e (prevent-default)))))))
-              
-              (:div.icon :id (format nil "favorite-~a" unique-id)
-                         (:span.s7-download))
-              (:div.icon :id (format nil "hide-~a" unique-id)
-                         (:span.s7-close-circle)))
-             (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
-               :href url (html-entities:decode-entities title))
-             (:br)
-             (:div
-               (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
-                 :href (format nil "https://www.reddit.com~a" permalink)
-                 (format nil "~a in ~a on ~a"
-                         author
-                         subreddit
-                         (with-output-to-string (sink)
-                           (local-time:format-timestring sink
-                                                         (local-time:unix-to-timestamp
-                                                          (rationalize created-utc))
-                                                         :format (list :month "/" :day "/" :year " " :hour ":" :min ":" :sec))))))
-             (:div :class "col-md-12")
-             (:script
-               (ps:ps*
-                `(with-document-ready
-                     (lambda ()
-                       (-> (sel ,(format nil "#favorite-~a" unique-id))
-                           (click (lambda (e)
-                                    (chain (sel ,(format nil "#wx~a" unique-id))
-                                           (load ,(format nil "/link/favorite/~a" id)))
-                                    (-> (sel ,(format nil "#wx~a" unique-id))
-                                        (toggle))
-                                    (-> e (prevent-default)))))
-                       (-> (sel ,(format nil "#hide-~a" unique-id))
-                           (click (lambda (e)
-                                    (chain (sel ,(format nil "#wx~a" unique-id))
-                                           (load ,(format nil "/link/hide/~a" (hunchentoot:url-encode id))))
-                                    (-> (sel ,(format nil "#wx~a" unique-id))
-                                        (toggle))
-                                    (-> e (prevent-default))))))))))
-           (if (link-nsfw link)
-               (let ((nsfw-button-id (format nil "nsfw~a" unique-id)))
-                 (:button.btn-primary.btn-xs :id nsfw-button-id
-                                             :style "margin-top:5px;margin-left:5px;"
-                                             :onclick (ps:ps*
-                                                       `(progn
-                                                          (-> (sel ,(format nil "#link-~a" unique-id))
-                                                              (load ,(format nil "/link/body/~a" id)))
-                                                          (-> (sel ,(format nil "#~a" nsfw-button-id)) (hide))))
-                                             "NSFW"))
-               (:script
-                 (ps:ps*
-                  `(with-document-ready
-                       (lambda ()
-                         (-> (sel ,(format nil "#link-~a" unique-id))
-                             (load ,(format nil "/link/body/~a" id)))
-                         (update-graph ,id))))))
-           (:div.panel-body :id (format nil "graph~a" id)
-                            :style "height:30px;margin-bottom:5px;")
-           (:div.panel-body :class "link-body"
-                            :style "padding: 10px 15px 15px;"
-                            :id (format nil "link-~a" unique-id))
-           (:div :class "panel-heading"
-             (:div
-               :class "icon comment-trigger"
-               :onclick (ps:ps* `(if (string= (-> (sel ,(format nil "#comments-~a" id))
-                                                  (css "display"))
-                                              "none")
-                                     (progn
-                                       (-> (sel ,(format nil "#comments-~a" id))
-                                           (toggle))
-                                       (-> (sel ,(format nil "#comments-~a" id))
-                                           (load ,(format nil "/comments/~a" id))))
-                                     (-> (sel ,(format nil "#comments-~a" id))
-                                         (toggle))))
+      (let ((unique-id (format nil "~a" (link-id link))))
+        (:div :class "col-md-4" :id (format nil "wx~a" (link-id link))
+              (:div.panel.panel-default.panel-borders.panel-heading-fullwidth
+               :style "border:1px solid rgb(7,7,7);"
+               (:div :class "panel-heading" :style "font-size:14px;padding: 15px 15px 10px;"
+                     (unless public
+                       (:div.tools
+                        (:div.icon (:a :id (format nil "hider-~a" unique-id)
+                                       (:i :class "s7-look")))
+                        (:script
+                         (ps:ps*
+                          `(-> (sel ,(format nil "#hider-~a" unique-id))
+                               (click (lambda (e)
+                                        (-> (sel ,(format nil "#link-~a" unique-id))
+                                            (toggle))
+                                        (-> e (prevent-default)))))))
+                        (make-author-link link)
+                        (:a :style "font-weight:bold;"
+                            :target (format nil "win-~a" unique-id)
+                            :href (format nil "/link/~a" id)
+                            (:div.icon (:span.s7-id)))
+                
+                        (:div.icon (:a :id (format nil "shadow-~a" unique-id)
+                                       (:i :class "s7-trash")))
+                        (:script
+                         (ps:ps*
+                          `(-> (sel ,(format nil "#shadow-~a" unique-id))
+                               (click (lambda (e)
+                                        (-> (sel ,(format nil "#wx~a" unique-id)) (toggle))
+                                        (-> (sel ,(format nil "#wx~a" unique-id)) (load ,(format nil "/shadow/~a" id)))
+                                        (-> e (prevent-default)))))))
+                
+                        (:div.icon :id (format nil "favorite-~a" unique-id)
+                                   (:span.s7-download))
+                        (:div.icon :id (format nil "hide-~a" unique-id)
+                                   (:span.s7-close-circle))
+                        (when (and (link-label-text link)
+                                   (not (eq :null (link-label-text link)))
+                                   (not (string= "false" (link-label-text link)))
+                                   (not (eq :db-null (link-label-text link))))
+                          (:br)
+                          (:span :class "label pull-right"
+                                 :style (format nil "font-size:8px;background-color:~a;color:~a"
+                                                (link-label-background-color link)
+                                                "white")
+                                 (ppcre:regex-replace-all "&amp;"
+                                                          (link-label-text link)
+                                                          "&")))))
+                     (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
+                         :href url (html-entities:decode-entities title))
+                     (:br)
+                     (:div
+                      (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
+                          :href (format nil "https://www.reddit.com~a" permalink)
+                          (format nil "~a in ~a on ~a"
+                                  author
+                                  subreddit
+                                  (with-output-to-string (sink)
+                                    (local-time:format-timestring sink
+                                                                  (local-time:unix-to-timestamp
+                                                                   (rationalize created-utc))
+                                                                  :format (list :month "/" :day "/" :year " " :hour ":" :min ":" :sec))))))
+                     (:div :class "col-md-12")
+                     (:script
+                      (ps:ps*
+                       `(with-document-ready
+                            (lambda ()
+                              (-> (sel ,(format nil "#favorite-~a" unique-id))
+                                  (click (lambda (e)
+                                           (chain (sel ,(format nil "#wx~a" unique-id))
+                                                  (load ,(format nil "/link/favorite/~a" id)))
+                                           (-> (sel ,(format nil "#wx~a" unique-id))
+                                               (toggle))
+                                           (-> e (prevent-default)))))
+                              (-> (sel ,(format nil "#hide-~a" unique-id))
+                                  (click (lambda (e)
+                                           (let ((selector ,(format nil "#wx~a" unique-id)))
+                                             (chain (sel selector)
+                                                    (load ,(format nil "/link/hide/~a" (hunchentoot:url-encode id))))
+                                             (-> (sel selector) (remove))
+                                             (-> e (prevent-default)))))))))))
+               (if (link-nsfw link)
+                   (let ((nsfw-button-id (format nil "nsfw~a" unique-id)))
+                     (:button.btn-primary.btn-xs :id nsfw-button-id
+                                                 :style "margin-top:5px;margin-left:5px;"
+                                                 :onclick (ps:ps*
+                                                           `(progn
+                                                              (-> (sel ,(format nil "#link-~a" unique-id))
+                                                                  (load ,(format nil "/link/body/~a" id)))
+                                                              (-> (sel ,(format nil "#~a" nsfw-button-id)) (hide))))
+                                                 "NSFW"))
+                   (:script
+                    (ps:ps*
+                     `(with-document-ready
+                          (lambda ()
+                            (-> (sel ,(format nil "#link-~a" unique-id))
+                                (load ,(format nil "/link/body/~a" id)))
+                            (update-graph ,id))))))
+               (:div.panel-body :id (format nil "graph~a" id)
+                                :style "height:30px;margin-bottom:5px;")
+               (:div.panel-body :class "link-body"
+                                :style "padding: 10px 15px 15px;"
+                                :id (format nil "link-~a" unique-id))
+               (:div :class "panel-heading"
+                     (:div
+                      :class "icon comment-trigger"
+                      :onclick (ps:ps* `(if (string= (-> (sel ,(format nil "#comments-~a" id))
+                                                         (css "display"))
+                                                     "none")
+                                            (progn
+                                              (-> (sel ,(format nil "#comments-~a" id))
+                                                  (toggle))
+                                              (-> (sel ,(format nil "#comments-~a" id))
+                                                  (load ,(format nil "/comments/~a" id))))
+                                            (-> (sel ,(format nil "#comments-~a" id))
+                                                (toggle))))
                
-               (:span :class "s7-download")))
-           (:div.panel-body :id (format nil "comments-~a" id)
-                            :style "display:none;"
-                            "Loading...")))))))
+                      (:span :class "s7-download")))
+               (:div.panel-body :id (format nil "comments-~a" id)
+                                :style "display:none;"
+                                "Loading...")))))))
 
 (defun fetcher-is-running-p ()
   (member "fetchers" (mapcar #'bt:thread-name
@@ -836,7 +907,7 @@
              (dolist (subreddit *subreddits-cache*)
                (with-slots (display-name id) subreddit
                  (:a
-                   :target (format nil "wxn~a" id)
+                   :target (format nil "wx~a" id)
                    :class "btn btn-primary btn-xs"
                    :href (format nil "/subreddit/~a/0" display-name)
                    display-name)))))))
@@ -882,7 +953,6 @@
          (unless (string= flair-text "false")
            (:span.text-warning :style "padding-left:4px;padding-right:4px;margin-left:5px;background-color:#444444;"
                                (comment-flair-text comment))))
-        
         (:br)
         (:span :style "font-size:14px;"
           (alex:if-let ((html-body (comment-body-html comment)))
@@ -1062,16 +1132,16 @@
 
 (defroute display-single-link ("/link/:id") ()
   (with-page ()
-    (display-link (with-pg (get-dao 'link id)))))
+    (display-link (with-pg (get-dao 'link id)) :public t)))
 
 (defroute display-subreddit ("/subreddit/:subid/:offset" :method :get) ()
   (let* ((offset-i (parse-integer offset))
-         (*display-offset* (+ offset-i 200)))
+         (*display-offset* (+ offset-i 1000)))
     (display-links
      (with-pg (query (:order-by (:limit (:select '* :from 'link
                                           :where (:and (:= 'subreddit subid)
                                                        (:= 'shadow nil)))
-                                        100 offset-i)
+                                        1000 offset-i)
                                 (:desc 'created-utc))
                      (:dao link))))))
 
@@ -1133,7 +1203,7 @@
            ;;   (drop-leading-spaces (drop-trailing-spaces string)))
            (has-image-suffix (string)
              (ppcre:scan ".jpg|.png$|.gif$|.JPG$|.PNG$|.GIF$" string))
-           (render-link (doc-hash)
+           (render-link (link doc-hash)
              (with-html-string
                (:div.row
                 (:div.col-md-12
@@ -1184,25 +1254,31 @@
                    (cond
 
                          
-                     (crossposted-reddit-video (:video :preload "auto" :class "img-responsive" :controls 1
+                     (crossposted-reddit-video (link-add-to-queue link crossposted-reddit-video)
+                                               (:video :preload "auto" :class "img-responsive" :controls 1
                                                  (:source :src crossposted-reddit-video))
                                                (:div "crossposted-reddit-video"))
                          
-                     (reddit-preview-of-imgur-gif (:video :preload "auto" :class "img-responsive" :controls 1
+                     (reddit-preview-of-imgur-gif (link-add-to-queue link reddit-preview-of-imgur-gif)
+                                                  (:video :preload "auto" :class "img-responsive" :controls 1
                                                     (:source :src reddit-preview-of-imgur-gif))
                                                   (:div "reddit-preview-of-imgur-gif"))
                          
                      (has-oembed-media (:raw (html-entities:decode-entities has-oembed-media))
                                        (:div "has-oembed-media"))
                      
-                     (url-is-mp4 (:video :preload "auto" :class "img-responsive" :controls "1"
+                     (url-is-mp4 (link-add-to-queue link (gethash "url" doc-hash)) 
+                                 (:video :preload "auto" :class "img-responsive" :controls "1"
                                    (:source :src (gethash "url" doc-hash)))
                                  (:div "url-is-mp4"))
                      
-                     (is-imgur-gifv (:video :preload "auto" :class "img-responsive" :controls "1"
-                                      (:source :src (ppcre:regex-replace ".gifv" (gethash "url" doc-hash) ".mp4")))
-                                    (:div "is-imgur-gifv"))
-                     (is-reddit-video (:video :preload "auto" :class "img-responsive" :controls 1
+                     (is-imgur-gifv (let ((thing (ppcre:regex-replace ".gifv" (gethash "url" doc-hash) ".mp4")))
+                                      (link-add-to-queue link thing)
+                                      (:video :preload "auto" :class "img-responsive" :controls "1"
+                                        (:source :src thing))
+                                      (:div "is-imgur-gifv")))
+                     (is-reddit-video (link-add-to-queue link is-reddit-video)
+                                      (:video :preload "auto" :class "img-responsive" :controls 1
                                         (:source :src is-reddit-video))
                                       (:div "is-reddit-video"))
                          
@@ -1228,12 +1304,15 @@
                                                                             "source"
                                                                             "url")))
                                                        (has-still-image (hash-get image-hash '("source" "url"))))
-                                                   (cond (has-mp4 (:video :preload "auto" :class "img-responsive"
+                                                   (cond (has-mp4 (link-add-to-queue link has-mp4)
+                                                                  (:video :preload "auto" :class "img-responsive"
                                                                     :controls 1
                                                                     (:source :src (html-entities:decode-entities has-mp4))))
-                                                         (has-gif (:img :class "img-responsive"
+                                                         (has-gif (link-add-to-queue link has-gif)
+                                                                  (:img :class "img-responsive"
                                                                     :src (html-entities:decode-entities has-gif)))
-                                                         (has-still-image (:img :class "img-responsive"
+                                                         (has-still-image (link-add-to-queue link has-still-image)
+                                                                          (:img :class "img-responsive"
                                                                             :src (html-entities:decode-entities has-still-image))))))))
                                         (:div "is-embedded-image"))
 
@@ -1242,10 +1321,13 @@
                                          (:div "url-is-imgur-image"))
 
                          
-                     (url-is-video (:video :class "img-responsive" :preload "auto" :controls "1"
-                                     (:source :src (html-entities:decode-entities url-is-video)))
-                                   (:div "url-is-video"))
-                     (url-is-image (:img.img-responsive :src url-is-image)
+                     (url-is-video (let ((video (html-entities:decode-entities url-is-video)))
+                                     (link-add-to-queue link video)
+                                     (:video :class "img-responsive" :preload "auto" :controls "1"
+                                       (:source :src (html-entities:decode-entities url-is-video)))
+                                     (:div "url-is-video")))
+                     (url-is-image (link-add-to-queue link url-is-image)
+                                   (:img.img-responsive :src url-is-image)
                                    (:div "url-is-image"))
                          
                          
@@ -1256,9 +1338,7 @@
                                              (handler-case (markdown:markdown decoded :stream sink)
                                                (error (condition)
                                                  (declare (ignore condition))
-                                                 (log:info "WEIRD MARKDOWN ERROR CAUGHT")
-                                                 decoded)))))
-                                        (:div "selftext_html"))
+                                                 (format sink "~a" decoded)))))))
                          
                      (has-selftext (:raw (html-entities:decode-entities has-selftext))
                                    (alex:when-let ((the-url (gethash "url" doc-hash nil)))
@@ -1272,8 +1352,8 @@
     (alex:when-let (link (with-pg (get-dao 'link id)))
       (let ((doc-hash (yason:parse (link-bulk link))))
         (alex:if-let ((has-crosspost-parent (car (gethash "crosspost_parent_list" doc-hash nil))))
-          (render-link has-crosspost-parent)
-          (render-link doc-hash))))))
+          (render-link link has-crosspost-parent)
+          (render-link link doc-hash))))))
 
 (defroute comment-history ("/graph/comment/history/:id") ()
   (setf (hunchentoot:content-type*) "application/json")
@@ -1324,7 +1404,7 @@
           (defvar ws nil)
           (defun ws-connect ()
             (defvar ws nil)
-            (setf ws (new (-web-socket "ws://127.0.0.1:8088/ws/news")))
+            (setf ws (new (-web-socket "ws://hypatia.ivy.io/ws/news")))
             (setf (@ ws onopen)
                   (lambda ()
                     (-> console (log "Connected."))
@@ -1346,6 +1426,10 @@
                       (-> ws (send "pong"))
                       (progn
                         (let ((env (-> -j-s-o-n (parse (@ event data)))))
+                          (when (string= (@ env action) "update-link")
+                            (let ((the-id (@ env id) "id"))
+                              (-> (sel (+ "#wx" the-id)) (remove))
+                              (add-link (@ env id))))
                           (when (string= (@ env action) "add-link")
                             (add-link (@ env id))
                             (update-graph (@ env id)))
@@ -1375,9 +1459,19 @@
                (lambda ()
                  (ws-connect))))))))))
 
+(defun get-links-by-text (searchtext)
+  (with-pg
+    (query (:select '* :from 'link
+             :where (:and (:= 'shadow nil)
+                          (:raw (format nil "to_tsvector('english',title) @@ to_tsquery('english','~a')"
+                                        searchtext))))
+           (:dao link))))
 
-;;eftjkxmrserlkkyu
-
+(defroute search-h ("/search" :method :post) (pattern)
+  (log:info "Searching... ~a" pattern)
+  (links-page
+   (dolist (link (get-links-by-text pattern))
+     (display-link link))))
 
 
 (defparameter *test-mailbox* (sb-concurrency:make-mailbox :name "testing"))
@@ -1394,4 +1488,69 @@
   (dotimes (count 50)
     (sb-concurrency:send-message *test-mailbox* (format nil "~a" count))))
 
-;; LP4TVRP34QZWS3
+
+(defgeneric link-add-to-queue (link url))
+
+(defmethod link-add-to-queue ((link link) (url string))
+  ;;(sb-concurrency:send-message *fetchbox* (list (link-id link) url))
+  )
+
+
+
+(defun start-link-cache-worker ()
+  (loop
+    (destructuring-bind (id url) (sb-concurrency:receive-message *fetchbox*)
+      (let ((link (with-pg (get-dao 'link id))))
+        (setf (link-remote-file link) url)
+        (link-create-cache link)))))
+
+
+(defmethod convert-remote-file ((link link))
+  (let ((oori (puri:parse-uri (link-remote-file link))))
+    (when (or (ppcre:scan "preview.redd.it" (puri:uri-host oori)))
+      (setf (puri:uri-host oori) "i.redd.it")
+      (setf (puri:uri-query oori) nil)
+      (let ((new-url (with-output-to-string (sink)
+                       (puri:render-uri oori sink))))
+        ;; (log:info "Was: ~a Now: ~a"
+        ;;           (link-remote-file link)
+        ;;           new-url)
+        (setf (link-remote-file link) new-url)
+        (with-pg (update-dao link))))))
+
+
+
+(defmethod save-to-local-file ((link link))
+  (let* ((uri (puri:parse-uri (link-remote-file link)))
+         (filename (ppcre:regex-replace "^/" (puri:uri-path uri) ""))
+         (full-pathname (asdf:system-relative-pathname :sup
+                                                       (format nil "static/store/~a"
+                                                               filename))))
+    (unless (probe-file full-pathname)
+      (let ((image-data (raw-get-reddit (link-remote-file link))))
+        (when image-data
+          (handler-case (progn
+                          (alex:write-byte-vector-into-file image-data full-pathname)
+                          (setf (link-store link) (format nil "/store/~a" filename))
+                          (log:info "saved"))
+            (sb-int:simple-file-error (condition)
+              (log:info "Caught ~a" condition)
+              nil)))))))
+
+
+(defgeneric link-create-cache (link))
+(defmethod link-create-cache ((link link))
+  (convert-remote-file link)
+  (save-to-local-file link)
+  (with-pg (update-dao link)))
+
+(defroute testing ("/staticles") ()
+  (let ((links (with-pg (query
+                         (:select 'id 'remotefile :from 'link :where (:and (:not-null 'remotefile)
+                                                                           (:= 'shadow nil)))))))
+    (links-page
+     (dolist (link links)
+       (destructuring-bind (link-id link-remote) link
+         (:div :class "col-md-2"
+           (:a :target "whadda" :href (format nil "/link/~a" link-id)
+             (:img.img-responsive :src (fixit link-remote)))))))))
