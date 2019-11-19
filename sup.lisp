@@ -1554,3 +1554,5 @@
          (:div :class "col-md-2"
            (:a :target "whadda" :href (format nil "/link/~a" link-id)
              (:img.img-responsive :src (fixit link-remote)))))))))
+
+
