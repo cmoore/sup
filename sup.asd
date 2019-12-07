@@ -21,9 +21,6 @@
                :split-sequence
                :cl-hash-util
                :safe-queue
-
-               :sb-concurrency
-               
                :cl-postgres+local-time
                :postmodern)
   
