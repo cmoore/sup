@@ -6,10 +6,13 @@
   (:use #:cl
         #:json-mop
         #:easy-routes
-        #:parenscript
         #:spinneret
         #:cl-hash-util
-        #:postmodern))
+        #:postmodern)
+  (:import-from :alexandria :when-let
+                :if-let :read-file-into-string
+                :switch :flatten
+                :alist-hash-table))
 
 (in-package #:sup)
 
@@ -41,12 +44,12 @@
                                        :where (:and (:= nil 'shadow))))))
       (let* ((the-link (get-dao 'link (car link-id)))
              (link-json (yason:parse (link-bulk the-link))))
-        (alexandria:when-let ((ltext (gethash "link_flair_text" link-json nil)))
+        (when-let ((ltext (gethash "link_flair_text" link-json nil)))
           (when (not (string= (link-label-text the-link) ltext))
             (setf (link-label-text the-link) ltext)
-            (alexandria:when-let ((lb (gethash "link_flair_background_color" link-json nil)))
+            (when-let ((lb (gethash "link_flair_background_color" link-json nil)))
               (setf (link-label-background-color the-link) lb))
-            (alexandria:when-let ((lc (gethash "link_flair_text_color" link-json nil)))
+            (when-let ((lc (gethash "link_flair_text_color" link-json nil)))
               (setf (link-label-color the-link) lc))
             (update-dao the-link)))))))
 
@@ -292,7 +295,7 @@
         (usocket:timeout-error (condition)
           (log:info "TIMED OUT - retrying: ~a" condition)
           (raw-get-reddit url)))
-    (alexandria:switch (code)
+    (switch (code)
       (200 (values data code))
       (503 (values nil code))
       (t (when retry
@@ -303,7 +306,7 @@
   (raw-get-reddit (format nil "https://reddit.com~a" path) :retry retry))
 
 (defun authenticate ()
-  (let ((config (yason:parse (alexandria:read-file-into-string
+  (let ((config (yason:parse (read-file-into-string
                               (asdf:system-relative-pathname :sup "config.json")))))
     (handler-case 
         (multiple-value-bind (result code)
@@ -317,7 +320,7 @@
                                                    (cons "password" (gethash "password" config)))
                                  :method :post
                                  :preserve-uri t)
-          (alexandria:switch (code)
+          (switch (code)
             ((or 503 504) (authenticate))
             (otherwise (setf *reddit-user*
                              (json-mop:json-to-clos result 'access-token)))))
@@ -358,7 +361,7 @@
 
 (ps:defpsmacro with-document-ready (&body body)
   `(progn
-     ((@ ($ document) ready) ,@body)))
+     ((ps:@ ($ document) ready) ,@body)))
 
 (ps:defpsmacro jq (selector &body body)
   `(-> (sel ,selector)
@@ -368,14 +371,14 @@
   `($ ,name))
 
 (ps:defpsmacro $. (name)
-  `(@ (sel ,name)))
+  `(ps:@ (sel ,name)))
 
 (ps:defpsmacro -> (&body body)
   `(ps:chain ,@body))
 
 (ps:defpsmacro map (func list)
   `(do ((i 0 (incf i)))
-       ((>= i (@ ,list length)))
+       ((>= i (ps:@ ,list length)))
      (funcall ,func (aref ,list i))))
 
 
@@ -440,16 +443,17 @@
                                                                                      "bearer ~a"
                                                                                      (access-token-access-token *reddit-user*)))))))
     (authenticate)
-    (alexandria:when-let ((post-data (gethash "data" (yason:parse
+    (when-let ((post-data (gethash "data" (yason:parse
                                                 (reddit-request "/subreddits/mine")))))
       (hash-extract "data"
                     (gethash "children" post-data)))))
 
 (defun sync-subreddits ()
-  (alexandria:if-let ((reddit-subreddits (get-reddit-subreddits)))
+  (if-let ((reddit-subreddits (get-reddit-subreddits)))
     (let* ((reddit-names (hash-extract "display_name" reddit-subreddits))
            (db-subreddits (with-pg (select-dao 'subreddit)))
-           (db-names (mapcar #'subreddit-display-name db-subreddits)))
+           (db-names (mapcar #'subreddit-display-name db-subreddits))
+           (needs-cleanup nil))
       
       ;; Confirm that all subscribed subreddits are in the database.
       (dolist (reddit-name reddit-names)
@@ -463,6 +467,7 @@
                                      :url (gethash "url" reddit-hash)
                                      :id (gethash "id" reddit-hash))))
             (update-subreddits-cache)
+            (setf needs-cleanup t)
             (log:info "Missing ~a" (gethash "display_name" reddit-hash)))))
       
       ;; Remove db subreddits that aren't currently subscribed.
@@ -473,7 +478,10 @@
                                                db-subreddits))))
             (log:info "Removing ~a" name)
             (with-pg (delete-dao db-record))
-            (update-subreddits-cache)))))
+            (setf needs-cleanup t)
+            (update-subreddits-cache))))
+      (when needs-cleanup
+        (cleanup)))
     (log:info "Failed")))
 
 (defun make-history-url (subreddit first-id)
@@ -481,7 +489,7 @@
           (subreddit-url subreddit) (format nil "t3_~a" first-id)))
 
 (defmethod get-latest-link-for-subreddit ((subreddit subreddit))
-  (car (alexandria:flatten
+  (car (flatten
         (with-pg (query (:limit (:order-by (:select 'id :from 'link
                                              :where (:= 'subreddit (subreddit-display-name subreddit)))
                                            (:asc 'created_utc))
@@ -506,7 +514,7 @@
                (dolist (link (hu:hash-get link-hash '("data" "children")))
                  (when (string= (gethash "kind" link) "t3")
                    (handle-possible-new-link (gethash "data" link))))
-               (alexandria:when-let ((next-page (hu:hash-get link-hash '("data" "after"))))
+               (when-let ((next-page (hu:hash-get link-hash '("data" "after"))))
                  (get-next-page next-page)))))
     (get-next-page (hu:hash-get (yason:parse (get-reddit (make-request-url)))
                                 '("data" "after")))))
@@ -533,12 +541,12 @@
             (log:info "Some sort of error:" condition)
             (log:info "Restarting.")
             (get-subreddit-links subreddit)))
-      (alexandria:switch (code)
+      (switch (code)
         (200 (typecase data
-               (string (alexandria:if-let ((json-data (safe-parse data)))
+               (string (if-let ((json-data (safe-parse data)))
                          (hu:hash-get json-data '("data" "children"))
                          (log:info "Links fetch was null? ~a ~a" code data)))
-               (list (alexandria:flatten data))))
+               (list (flatten data))))
         (t (log:info "Connecting to reddit failed with: ~a for ~a"
                      code (subreddit-display-name subreddit)))))))
 
@@ -548,7 +556,7 @@
 
 (defmethod send-update-graph ((link link))
   (mp:mailbox-send *mailbox*
-                   (to-json (alexandria:alist-hash-table
+                   (to-json (alist-hash-table
                              (list (cons "id" (link-id link))
                                    (cons "action" "update-graph"))))))
 
@@ -571,7 +579,7 @@
           (flexi-streams:external-format-encoding-error (condition)
             (log:info "ENCODING ERROR: ~a" condition)
             (values 201 "NOTHING")))
-      (alexandria:switch (code)
+      (switch (code)
         (200 (dolist (comment-hash (yason:parse data))
                (dolist (listing (ignore-errors (hu:hash-get comment-hash '("data" "children"))))
                  (when (string= (gethash "kind" listing) "t1")
@@ -581,7 +589,7 @@
 (defmethod update-comment-votes ((comment comment)
                                  (id string)
                                  (count integer))
-  (alexandria:if-let ((maybe-votes (with-pg (get-dao 'comment-votes id))))
+  (if-let ((maybe-votes (with-pg (get-dao 'comment-votes id))))
     (progn
       (let ((votes (make-array (length (comment-votes-scores maybe-votes))
                                :initial-contents (comment-votes-scores maybe-votes)
@@ -604,7 +612,7 @@
                                                  ;; back as a simple-vector
                                                  :scores (vector (gethash "score" link-hash))))))
            (update-like-cache ()
-             (alexandria:if-let ((up-hist (with-pg (get-dao 'up-history (gethash "id" link-hash)))))
+             (if-let ((up-hist (with-pg (get-dao 'up-history (gethash "id" link-hash)))))
                (progn
                  (let ((scores (make-array (length (up-history-scores up-hist))
                                            :initial-contents (up-history-scores up-hist)
@@ -619,23 +627,23 @@
     (when (is-repostp link-hash)
       (return-from handle-possible-new-link))
 
-    (alexandria:if-let ((existing-link (with-pg
+    (if-let ((existing-link (with-pg
                                    (get-dao 'link
                                             (gethash "id" link-hash)))))
       (progn
         (when update
-          (alexandria:when-let ((ltext (gethash "link_flair_text" link-hash nil)))
+          (when-let ((ltext (gethash "link_flair_text" link-hash nil)))
             (when (not (string= ltext
                                 (link-label-text existing-link)))
               (setf (link-label-text existing-link) ltext)
-              (alexandria:when-let ((lb (gethash "link_flair_background_color" link-hash nil)))
+              (when-let ((lb (gethash "link_flair_background_color" link-hash nil)))
                 (setf (link-label-background-color existing-link) lb))
-              (alexandria:when-let ((lc (gethash "link_flair_text_color" link-hash nil)))
+              (when-let ((lc (gethash "link_flair_text_color" link-hash nil)))
                 (setf (link-label-color existing-link) lc))
               (unless (link-hidden existing-link)
                 (mp:mailbox-send *mailbox*
                                              (to-json
-                                              (alexandria:alist-hash-table
+                                              (alist-hash-table
                                                (list (cons "id" (gethash "id" link-hash))
                                                      (cons "action" "update-link")))))))
             (with-pg (update-dao existing-link)))
@@ -644,14 +652,14 @@
           (update-like-cache))
         (mp:mailbox-send *mailbox*
                                      (to-json
-                                      (alexandria:alist-hash-table
+                                      (alist-hash-table
                                        (list (cons "id" (gethash "id" link-hash))
                                              (cons "action" "update-graph"))))))
       
       (unless (has-seen-p (gethash "id" link-hash))
-        (log:info "~a ~a"
-                  (gethash "subreddit" link-hash)
-                  (gethash "title" link-hash))
+        ;; (log:info "~a ~a"
+        ;;           (gethash "subreddit" link-hash)
+        ;;           (gethash "title" link-hash))
         (let ((new-link (make-instance 'link
                                        :id (gethash "id" link-hash)
                                        :hidden nil
@@ -680,7 +688,7 @@
           (when update
             (update-like-cache))
           (mp:mailbox-send *mailbox*
-                                       (to-json (alexandria:alist-hash-table
+                                       (to-json (alist-hash-table
                                                  (list (cons "id" (link-id new-link))
                                                        (cons "action" "add-link")))))
           (send-update-graph new-link))))))
@@ -798,7 +806,7 @@
                             (lambda ()
                               (-> (sel ,(format nil "#favorite-~a" unique-id))
                                   (click (lambda (e)
-                                           (chain (sel ,(format nil "#wx~a" unique-id))
+                                           (ps:chain (sel ,(format nil "#wx~a" unique-id))
                                                   (load ,(format nil "/link/favorite/~a" id)))
                                            (-> (sel ,(format nil "#wx~a" unique-id))
                                                (toggle))
@@ -806,7 +814,7 @@
                               (-> (sel ,(format nil "#hide-~a" unique-id))
                                   (click (lambda (e)
                                            (let ((selector ,(format nil "#wx~a" unique-id)))
-                                             (chain (sel selector)
+                                             (ps:chain (sel selector)
                                                     (load ,(format nil "/link/hide/~a" (hunchentoot:url-encode id))))
                                              (-> (sel selector) (remove))
                                              (-> e (prevent-default)))))))))))
@@ -911,12 +919,12 @@
        (:raw
         (ps:ps
           (defun update-graph (link-id)
-            (-> $ (ajax (create :type "get"
+            (-> $ (ajax (ps:create :type "get"
                                 :url (concatenate 'string "/graph/history/" link-id)
                                 :success (lambda (obj)
                                            (-> (sel (concatenate 'string "#graph" link-id))
                                                (sparkline obj
-                                                          (create :width "100%"
+                                                          (ps:create :width "100%"
                                                                   :height "35"
                                                                   :line-width 1.7)))))))))))))
 
@@ -950,7 +958,7 @@
                                (comment-flair-text comment))))
         (:br)
         (:span :style "font-size:14px;"
-          (alexandria:if-let ((html-body (comment-body-html comment)))
+          (if-let ((html-body (comment-body-html comment)))
             (:raw (html-entities:decode-entities html-body))
             (with-output-to-string (sink)
               (ignore-errors (cl-markdown:markdown body :stream *html*)))))
@@ -961,7 +969,7 @@
               (display-comment reply))))))))
 
 (defun add-or-update-comment (comment-hash)
-  (alexandria:when-let ((db-comment (with-pg (get-dao 'comment (gethash "id" comment-hash)))))
+  (when-let ((db-comment (with-pg (get-dao 'comment (gethash "id" comment-hash)))))
     (with-pg (delete-dao db-comment)))
   (let ((new-comment (make-instance 'comment
                                     :id (gethash "id" comment-hash)
@@ -1019,7 +1027,7 @@
                                 (:dao link))))
     (mp:mailbox-send *mailbox*
                      (to-json
-                      (alexandria:alist-hash-table
+                      (alist-hash-table
                        (list (cons "action" "add-link")
                              (cons "id" (link-id link))))))))
 
@@ -1038,7 +1046,7 @@
 (defun start-ws-reader-thread ()
   (bt:make-thread (lambda ()
                     (loop
-                      (alexandria:if-let ((message (mp:mailbox-read *mailbox*)))
+                      (if-let ((message (mp:mailbox-read *mailbox*)))
                         (handler-case (broadcast (car *chat-rooms*) message)
                           (error (condition)
                             (log:info "Error broadcasting message: ~a" condition)))
@@ -1052,26 +1060,26 @@
 
 (defun cleanup ()
   (labels ((remove-comment-by-parent (parent)
-             (dolist (comment-id (alexandria:flatten (with-pg (query (:select 'id :from 'comment
+             (dolist (comment-id (flatten (with-pg (query (:select 'id :from 'comment
                                                                  :where (:= 'parent parent))))))
                (remove-comment-by-parent (format nil "t1_~a" comment-id))
                (with-pg (execute "delete from comment where id = $1"
                                  comment-id)))))
-    (let ((subreddits (alexandria:flatten (with-pg (query (:select 'display-name :from 'subreddit))))))
+    (let ((subreddits (flatten (with-pg (query (:select 'display-name :from 'subreddit))))))
       (dolist (link (with-pg (query (:select 'id 'subreddit :from 'link))))
         (destructuring-bind (id subreddit) link
           (unless (member subreddit subreddits :test #'string=)
             (with-pg (delete-dao (get-dao 'link id)))))))
 
     
-    (dolist (comment-parent (alexandria:flatten (with-pg (query (:select 'parent :from 'comment)))))
+    (dolist (comment-parent (flatten (with-pg (query (:select 'parent :from 'comment)))))
       (when (ppcre:scan "^t3_" comment-parent)
-        (unless (car (alexandria:flatten
+        (unless (car (flatten
                       (with-pg (query (:select 'id :from 'link
                                         :where (:= 'id (ppcre:regex-replace "^t3_" comment-parent "")))))))
           (remove-comment-by-parent comment-parent))))
     
-    (dolist (vote-id (alexandria:flatten (with-pg (query (:select 'id :from 'up-history)))))
+    (dolist (vote-id (flatten (with-pg (query (:select 'id :from 'up-history)))))
       (unless (car (with-pg (query (:select 'id :from 'link :where (:= 'id vote-id)))))
         (with-pg (delete-dao (get-dao 'up-history vote-id)))))
 
@@ -1087,7 +1095,7 @@
     (sync-subreddit subreddit)))
 
 (defun mark-everything-older-than-a-month-as-read ()
-  (dolist (linkid (alexandria:flatten
+  (dolist (linkid (flatten
                    (with-pg (query (:order-by (:select 'id :from 'link :where
                                                 (:and (:= 'hidden nil)
                                                       (:>= (- (cl-ivy:epoch-time) (* 2 24 60 60))
@@ -1114,7 +1122,7 @@
 
 (defroute get-votes ("/votes/:id") ()
   (setf (hunchentoot:content-type*) "application/json")
-  (alexandria:if-let ((up-history (with-pg (get-dao 'up-history id))))
+  (if-let ((up-history (with-pg (get-dao 'up-history id))))
     (with-output-to-string (sink)
       (yason:encode (up-history-scores up-history) sink))
     "[]"))
@@ -1147,7 +1155,7 @@
                                  (:dao link)))))
 
 (defroute shadow-link ("/shadow/:id") ()
-  (alexandria:when-let ((link (with-pg (get-dao 'link id))))
+  (when-let ((link (with-pg (get-dao 'link id))))
     (setf (link-shadow link) t)
     (setf (link-hidden link) t)
     (with-pg (update-dao link))
@@ -1157,13 +1165,13 @@
   (hunchentoot:redirect "/live"))
 
 (defroute hide-link ("/link/hide/:id") ()
-  (alexandria:when-let ((link (with-pg (get-dao 'link id))))
+  (when-let ((link (with-pg (get-dao 'link id))))
     (setf (link-hidden link) t)
     (with-pg (update-dao link)))
   "ok")
 
 (defroute make-favorite ("/link/favorite/:id") ()
-  (alexandria:when-let ((link (with-pg (get-dao 'link id))))
+  (when-let ((link (with-pg (get-dao 'link id))))
     (if (link-hidden link)
       (progn
         (setf (link-hidden link) nil)
@@ -1177,7 +1185,7 @@
 
 (defroute show-comments ("/comments/:id") ()
   (update-link-comments (with-pg (get-dao 'link id)))
-  (alexandria:if-let ((comments (with-pg
+  (if-let ((comments (with-pg
                     (query (:order-by (:select '* :from 'comment
                                         :where (:= 'parent (format nil "t3_~a" id)))
                                       (:desc 'score))
@@ -1228,15 +1236,15 @@
                        (has-oembed-media (hash-get doc-hash
                                                    '("secure_media" "oembed" "html")))
                        
-                       (url-is-imgur-image (alexandria:when-let ((url (gethash "url" doc-hash)))
+                       (url-is-imgur-image (when-let ((url (gethash "url" doc-hash)))
                                              (when (ppcre:scan "imgur.com" url)
                                                (ppcre:regex-replace "https?://i?.?imgur.com/" url ""))))
                        
-                       (url-is-video (alexandria:when-let ((url (gethash "url" doc-hash)))
+                       (url-is-video (when-let ((url (gethash "url" doc-hash)))
                                        (when (ppcre:scan ".mp4|.MP4" url)
                                          url)))
                        
-                       (url-is-image (alexandria:when-let ((url (gethash "url" doc-hash)))
+                       (url-is-image (when-let ((url (gethash "url" doc-hash)))
                                        (when (has-image-suffix url)
                                          url)))
                        
@@ -1249,33 +1257,32 @@
                    (cond
 
                          
-                     (crossposted-reddit-video (link-add-to-queue link crossposted-reddit-video)
-                                               (:video :preload "auto" :class "img-responsive" :controls 1
-                                                 (:source :src crossposted-reddit-video))
-                                               (:div "crossposted-reddit-video"))
+                     (crossposted-reddit-video
+                      (:video :preload "auto" :class "img-responsive" :controls 1
+                        (:source :src crossposted-reddit-video))
+                      (:div "crossposted-reddit-video"))
                          
-                     (reddit-preview-of-imgur-gif (link-add-to-queue link reddit-preview-of-imgur-gif)
-                                                  (:video :preload "auto" :class "img-responsive" :controls 1
-                                                    (:source :src reddit-preview-of-imgur-gif))
-                                                  (:div "reddit-preview-of-imgur-gif"))
+                     (reddit-preview-of-imgur-gif
+                      (:video :preload "auto" :class "img-responsive" :controls 1
+                        (:source :src reddit-preview-of-imgur-gif))
+                      (:div "reddit-preview-of-imgur-gif"))
                          
                      (has-oembed-media (:raw (html-entities:decode-entities has-oembed-media))
                                        (:div "has-oembed-media"))
                      
-                     (url-is-mp4 (link-add-to-queue link (gethash "url" doc-hash)) 
-                                 (:video :preload "auto" :class "img-responsive" :controls "1"
-                                   (:source :src (gethash "url" doc-hash)))
-                                 (:div "url-is-mp4"))
+                     (url-is-mp4
+                      (:video :preload "auto" :class "img-responsive" :controls "1"
+                        (:source :src (gethash "url" doc-hash)))
+                      (:div "url-is-mp4"))
                      
                      (is-imgur-gifv (let ((thing (ppcre:regex-replace ".gifv" (gethash "url" doc-hash) ".mp4")))
-                                      (link-add-to-queue link thing)
                                       (:video :preload "auto" :class "img-responsive" :controls "1"
                                         (:source :src thing))
                                       (:div "is-imgur-gifv")))
-                     (is-reddit-video (link-add-to-queue link is-reddit-video)
-                                      (:video :preload "auto" :class "img-responsive" :controls 1
-                                        (:source :src is-reddit-video))
-                                      (:div "is-reddit-video"))
+                     (is-reddit-video
+                      (:video :preload "auto" :class "img-responsive" :controls 1
+                        (:source :src is-reddit-video))
+                      (:div "is-reddit-video"))
                          
                      ;; Matches if the post is a crosspost and the original
                      ;; has a video hosted at reddit
@@ -1299,16 +1306,16 @@
                                                                             "source"
                                                                             "url")))
                                                        (has-still-image (hash-get image-hash '("source" "url"))))
-                                                   (cond (has-mp4 (link-add-to-queue link has-mp4)
-                                                                  (:video :preload "auto" :class "img-responsive"
-                                                                    :controls 1
-                                                                    (:source :src (html-entities:decode-entities has-mp4))))
-                                                         (has-gif (link-add-to-queue link has-gif)
-                                                                  (:img :class "img-responsive"
-                                                                    :src (html-entities:decode-entities has-gif)))
-                                                         (has-still-image (link-add-to-queue link has-still-image)
-                                                                          (:img :class "img-responsive"
-                                                                            :src (html-entities:decode-entities has-still-image))))))))
+                                                   (cond (has-mp4
+                                                          (:video :preload "auto" :class "img-responsive"
+                                                            :controls 1
+                                                            (:source :src (html-entities:decode-entities has-mp4))))
+                                                         (has-gif
+                                                          (:img :class "img-responsive"
+                                                            :src (html-entities:decode-entities has-gif)))
+                                                         (has-still-image
+                                                          (:img :class "img-responsive"
+                                                            :src (html-entities:decode-entities has-still-image))))))))
                                         (:div "is-embedded-image"))
 
                      (url-is-imgur-image (:blockquote.imgur-embed-pub :data-id url-is-imgur-image)
@@ -1317,13 +1324,12 @@
 
                          
                      (url-is-video (let ((video (html-entities:decode-entities url-is-video)))
-                                     (link-add-to-queue link video)
                                      (:video :class "img-responsive" :preload "auto" :controls "1"
                                        (:source :src (html-entities:decode-entities url-is-video)))
                                      (:div "url-is-video")))
-                     (url-is-image (link-add-to-queue link url-is-image)
-                                   (:img.img-responsive :src url-is-image)
-                                   (:div "url-is-image"))
+                     (url-is-image
+                      (:img.img-responsive :src url-is-image)
+                      (:div "url-is-image"))
                          
                          
                          
@@ -1336,7 +1342,7 @@
                                                  (format sink "~a" decoded)))))))
                          
                      (has-selftext (:raw (html-entities:decode-entities has-selftext))
-                                   (alexandria:when-let ((the-url (gethash "url" doc-hash nil)))
+                                   (when-let ((the-url (gethash "url" doc-hash nil)))
                                      (:a :target (format nil "~a" (get-universal-time)) :href the-url the-url))
                                    (:div "selftext"))
                          
@@ -1344,22 +1350,22 @@
                          
                      (t (:div "What the hell is this?")))))))))
 
-    (alexandria:when-let (link (with-pg (get-dao 'link id)))
+    (when-let (link (with-pg (get-dao 'link id)))
       (let ((doc-hash (yason:parse (link-bulk link))))
-        (alexandria:if-let ((has-crosspost-parent (car (gethash "crosspost_parent_list" doc-hash nil))))
-          (render-link link has-crosspost-parent)
-          (render-link link doc-hash))))))
+        (if-let ((has-crosspost-parent (car (gethash "crosspost_parent_list" doc-hash nil))))
+                           (render-link link has-crosspost-parent)
+                           (render-link link doc-hash))))))
 
 (defroute comment-history ("/graph/comment/history/:id") ()
   (setf (hunchentoot:content-type*) "application/json")
-  (alexandria:if-let ((history (with-pg (get-dao 'comment-votes id))))
+  (if-let ((history (with-pg (get-dao 'comment-votes id))))
     (with-output-to-string (sink)
       (yason:encode (comment-votes-scores history) sink))
     "[]"))
 
 (defroute make-history ("/graph/history/:id") ()
   (setf (hunchentoot:content-type*) "application/json")
-  (alexandria:if-let ((history (with-pg (get-dao 'up-history id))))
+  (if-let ((history (with-pg (get-dao 'up-history id))))
     (with-output-to-string (sink)
       (yason:encode (up-history-scores history) sink))
     "[]"))
@@ -1385,7 +1391,7 @@
                  (remove-duplicates
                   (remove-if-not (lambda (thing)
                                    (ppcre:scan "^t3_" thing))
-                                 (alexandria:flatten (with-pg (query (:select 'parent :from 'comment :where (:= 'author "clintm"))))))))
+                                 (flatten (with-pg (query (:select 'parent :from 'comment :where (:= 'author "clintm"))))))))
          #'> :key #'link-created-utc)))
 
 (defroute live ("/live") ()
@@ -1394,54 +1400,54 @@
    (:div :id "loader")
    (:script
      (:raw
-      (ps*
+      (ps:ps*
        `(progn
           (defvar ws nil)
           (defun ws-connect ()
             (defvar ws nil)
-            (setf ws (new (-web-socket "ws://localhost:8088/ws/news")))
-            (setf (@ ws onopen)
+            (setf ws (ps:new (-web-socket "ws://localhost:8088/ws/news")))
+            (setf (ps:@ ws onopen)
                   (lambda ()
                     (-> console (log "Connected."))
                     (set-interval (lambda ()
                                     (-> ws (send "ping")))
                                   5000)))
-            (setf (@ ws onerror) (lambda (event)
+            (setf (ps:@ ws onerror) (lambda (event)
                                    (-> console (log (concatentate 'string
                                                                   "Websockets error"
-                                                                  (@ event data)
+                                                                  (ps:@ event data)
                                                                   "\n")))))
-            (setf (@ ws onclose) (lambda ()
+            (setf (ps:@ ws onclose) (lambda ()
                                    (-> console (log "Connection closed."))))
-            (setf (@ ws onmessage)
+            (setf (ps:@ ws onmessage)
                   (lambda (event)
-                    (if (string= (@ event data) "pong")
+                    (if (string= (ps:@ event data) "pong")
                       (-> console (log "pongers")))
-                    (if (string= (@ event data) "ping")
+                    (if (string= (ps:@ event data) "ping")
                       (-> ws (send "pong"))
                       (progn
-                        (let ((env (-> -j-s-o-n (parse (@ event data)))))
-                          (when (string= (@ env action) "update-link")
-                            (let ((the-id (@ env id) "id"))
+                        (let ((env (-> -j-s-o-n (parse (ps:@ event data)))))
+                          (when (string= (ps:@ env action) "update-link")
+                            (let ((the-id (ps:@ env id) "id"))
                               (-> (sel (+ "#wx" the-id)) (remove))
-                              (add-link (@ env id))))
-                          (when (string= (@ env action) "add-link")
-                            (add-link (@ env id))
-                            (update-graph (@ env id)))
-                          (when (string= (@ env action) "update-graph")
-                            (update-graph (@ env id)))))))))
+                              (add-link (ps:@ env id))))
+                          (when (string= (ps:@ env action) "add-link")
+                            (add-link (ps:@ env id))
+                            (update-graph (ps:@ env id)))
+                          (when (string= (ps:@ env action) "update-graph")
+                            (update-graph (ps:@ env id)))))))))
 
           (defun update-graph (link-id)
-            (-> $ (ajax (create :type "get"
+            (-> $ (ajax (ps:create :type "get"
                                 :url (concatenate 'string "/graph/history/" link-id)
                                 :success (lambda (obj)
                                            (-> (sel (concatenate 'string "#graph" link-id))
                                                (sparkline obj
-                                                          (create :width "100%"
+                                                          (ps:create :width "100%"
                                                                   :height "35"
                                                                   :line-width 1.7))))))))
           (defun add-link (link-id)
-            (-> $ (ajax (create :type "get"
+            (-> $ (ajax (ps:create :type "get"
                                 :url (concatenate 'string "/singlelink/" link-id)
                                 :error (lambda (e)
                                          (-> console (log e)))
@@ -1468,3 +1474,9 @@
    (dolist (link (get-links-by-text pattern))
      (display-link link))))
 
+
+(defun start ()
+  (start-server)
+  (start-refresh-threads)
+  (start-ws-server)
+  (start-ws-reader-thread))
