@@ -21,7 +21,6 @@
                :split-sequence
                :cl-hash-util
                :safe-queue
-               :cl-postgres+local-time
-               :postmodern)
-  
+               :cl-mango)
+
   :components ((:file "sup")))
