@@ -7,11 +7,13 @@
         #:json-mop
         #:easy-routes
         #:spinneret
-        #:cl-hash-util)
+        #:cl-hash-util
+        #:postmodern)
   (:import-from :alexandria :when-let :when-let*
                 :if-let :read-file-into-string
                 :switch :flatten
                 :alist-hash-table))
+
 
 (in-package #:sup)
 
@@ -34,6 +36,8 @@
             (yason:parse
              (mango:couch-query "reddit" ,@args))))
 
+
+
 (defmacro aht (&body args)
   `(alist-hash-table
     (list ,@args)))
@@ -44,7 +48,6 @@
             :sort (list (alist-hash-table
                          (list (cons "display_name" "asc"))))))
   nil)
-
 
 (defvar *reddit-user* nil)
 
@@ -353,10 +356,10 @@
                 (gethash "title" link-hash))
       (setf (gethash "type" link-hash) "link")
       (setf (gethash "hidden" link-hash) nil)
+      (setf (gethash "shadow" link-hash) nil)
       (setf (gethash "scores" link-hash) (list (gethash "score" link-hash)
                                                (gethash "score" link-hash)))
       (put-link link-hash)
-      (add-seen (gethash "name" link-hash))
       (#+lispworks mp:mailbox-send
        #+sbcl sb-concurrency:send-message
        *mailbox*
@@ -383,7 +386,7 @@
     (get-next-page (hu:hash-get (yason:parse (get-reddit (make-request-url)))
                                 '("data" "after")))))
 
-(defun get-subreddit-links (subreddit-hash)
+(defun get-subreddit-links (subreddit-hash &key new)
   (declare (optimize (debug 3)))
   (labels ((safe-parse (blob)
              (handler-case (yason:parse blob)
@@ -392,17 +395,21 @@
                  nil))))
     (multiple-value-bind (data code)
         (handler-case
-            (let ((wtf-url (format nil "/~a/.json?limit=100"
-                                   (gethash "display_name_prefixed"
-                                            subreddit-hash))))
-              (get-reddit wtf-url))
+            (let* ((display-name-prefixed (gethash "display_name_prefixed"
+                                                   subreddit-hash))
+                   (fetch-url (if new
+                                (format nil "/~a/.json?limit=100" display-name-prefixed)
+                                (format nil "/~a/new/.json?limit=100" display-name-prefixed))))
+              (get-reddit fetch-url))
           (usocket:timeout-error (condition)
             (declare (ignore condition))
             (log:info "Timeout error.  Restarting.")
+            (sleep 2)
             (get-subreddit-links subreddit-hash))
           (error (condition)
             (log:info "Some sort of error:" condition)
             (log:info "Restarting.")
+            (sleep 2)
             (get-subreddit-links subreddit-hash)))
       (switch (code)
         (200 (typecase data
@@ -454,7 +461,10 @@
   (let ((yason:*parse-json-booleans-as-symbols* nil))
     (unless (ppcre:scan "u_" (gethash "display_name" subreddit))
       (dolist (link (hash-extract "data" (get-subreddit-links subreddit)))
-        (handle-possible-new-link link)))))
+        (handle-possible-new-link link))
+      ;; (dolist (link (hash-extract "data" (get-subreddit-links subreddit :new t)))
+      ;;   (handle-possible-new-link link))
+      )))
 
 (defun scan-subreddits ()
   (dolist (subreddit (cq (list (cons "type" "subreddit"))))
@@ -472,8 +482,8 @@
   (cl-ivy:stop-thread-by-name "fetchers"))
 
 (defun mark-subreddit-as-read (subreddit-display-name)
-  (when-let ((subreddit (car (cq (list (cons "display_name" subreddit-display-name)
-                                  (cons "type" "subreddit"))
+  (when-let ((subreddit (car (cq `(("display_name" . ,subreddit-display-name)
+                                   ("type" . "subreddit"))
                             :limit 1
                             :fields (list "name")))))
     (let ((links (cq (list (cons "subreddit_id" (gethash "name" subreddit))
@@ -492,7 +502,7 @@
         (:div :class "col-md-4 post" :id (format nil "wx~a" unique-id)
           (:div.panel.panel-default.panel-borders.panel-heading-fullwidth
            :style "border:1px solid rgb(7,7,7);"
-           (:div :class "panel-heading" :style "font-size:14px;padding: 15px 15px 10px;"
+           (:div :class "panel-heading" :style "overflow:hidden;font-size:14px;padding: 15px 15px 10px;"
              (unless public
                (:div.tools (:div.icon (:a :id (format nil "hider-~a" unique-id)
                                         (:i :class "s7-look")))
@@ -545,6 +555,7 @@
                                                             "&")))))))
              (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
                :href (gethash "url" link-hash)
+               :title (gethash "title" link-hash)
                (html-entities:decode-entities
                 (gethash "title" link-hash)))
              (:br)
@@ -651,7 +662,7 @@
                (:a :class "btn btn-default btn-xs" :id "hidebutton" :type "button" :href "#" "C")
                (:script (ps:ps (-> (sel "#hidebutton")
                                    (click (lambda (e)
-                                            (-> (sel ".link-body") (hide))
+                                            (-> (sel ".link-body") (toggle))
                                             (-> e (prevent-default)))))))
 
                (:a :class "btn btn-default btn-xs" :id "expandcomments" :type "button" :href "#" "E")
@@ -674,9 +685,8 @@
                (:a
                  :target (format nil "wx~a" (gethash "name" subreddit))
                  :class "btn btn-primary btn-xs"
-                 :href (format nil "/subreddit/~a/0" (gethash "name" subreddit))
-                 (gethash "display_name" subreddit))))))
-       )
+                 :href (format nil "/subreddit/~a/0" (gethash "display_name" subreddit))
+                 (gethash "display_name" subreddit)))))))
      ,@body
      (:script
        (:raw
@@ -820,21 +830,28 @@
   (start-refresh-threads)
   (hunchentoot:redirect "/live"))
 
-(defroute display-subreddit ("/subreddit/:subid/:offset" :method :get) ()
-  (let* ((offset-i (or (parse-integer offset) 0))
+(defroute display-subreddit-glorp ("/subreddit/:name/:offset" :method :get) ()
+  (let* ((offset-i (typecase offset
+                     (fixnum offset)
+                     (string (parse-integer offset))))
          (*display-offset* (+ offset-i 100)))
     (display-links
-     (cq (list (cons "type" "link")
-          (cons "$or" (list (alist-hash-table
-                             (list (cons "shadow" (alist-hash-table
-                                                   (list (cons "$exists" 'yason:false))))))
-                            (alist-hash-table
-                             (list (cons "shadow" 'yason:false)))))
-          (cons "subreddit_id" subid))
-         :skip offset-i
-         :limit 100
-         :sort (list (alist-hash-table
-                      (list (cons "created_utc" "desc"))))))))
+     (cq
+      (list (cons "type" "link")
+            ;; (cons "$or" (aht
+            ;;               (cons "shadow" (aht (cons "$exists" 'yason:false)))
+            ;;               (cons "shadow" )))
+            ;;(cons "shadow" 'yason:false)
+            ;; (cons "$or" (list (alist-hash-table
+            ;;                    (list (cons "shadow" (alist-hash-table
+            ;;                                          (list (cons "$exists" 'yason:false))))))
+            ;;                   (alist-hash-table
+            ;;                    (list (cons "shadow" 'yason:false)))))
+            (cons "subreddit" name))
+      :skip offset-i
+      :limit 100
+      :sort (list (alist-hash-table
+                   (list (cons "created_utc" "desc"))))))))
 
 (defroute favorites ("/favorites") ()
   (display-links (cq '(("favorite" . t)
@@ -875,7 +892,7 @@
       ;;(mango:doc-put "reddit" (to-json link))
       "ok")))
 
-(defroute make-favorite ("/link/favorite/name/:name") ()
+(defroute make-favorite-by-name ("/link/favorite/name/:name") ()
   (when-let ((document (handler-case (car (cq `(("type" . "link")
                                                 ("name" . ,name))))
                          (mango:unexpected-http-response (condition)
