@@ -34,6 +34,9 @@
             (yason:parse
              (mango:couch-query "reddit" ,@args))))
 
+(defmacro aht (&body args)
+  `(alist-hash-table
+    (list ,@args)))
 
 (defun update-subreddits-cache ()
   (setf *subreddits-cache*
@@ -56,18 +59,14 @@
   #+lispworks (mp:make-mailbox :name "Image fetch box")
   #+sbcl (sb-concurrency:make-mailbox :name "Image fetch box"))
 
+(defvar *workbox*
+  #+lispworks (mp:make-mailbox :name "Work Box")
+  #+sbcl (sb-concurrency:make-mailbox :name "Work Box"))
+
 
 (defun has-seen-p (name)
   (car (cq `(("name" . ,name)
              ("type" . "link")))))
-
-(defun add-seen (id)
-  (unless (has-seen-p id)
-    (mango:doc-put "reddit"
-                   (to-json (alist-hash-table
-                             (list (cons "id" id)
-                                   (cons "type" "seen")))))))
-
 
 (defun make-author-link (link-hash)
   (with-html
@@ -76,13 +75,14 @@
        :href (format nil "/author/~a" (gethash "author" link-hash))
        (:i :class "s7-user-female")))))
 
-;; (defmethod make-author-link ((comment comment))
-;;   (with-slots (author) comment
-;;     (with-html
-;;       (:div.icon
-;;        (:a :target (format nil "~aauthorcomments" author)
-;;          :href (format nil "/comments/author/~a" author)
-;;          (:i :class "s7-note"))))))
+(defun make-author-link-from-comment (comment-hash)
+  (let ((author (gethash "author" comment-hash)))
+    (with-html
+      (:div.icon
+       (:a
+         :target (format nil "~aauthorcomments" author)
+         :href (format nil "/comments/author/~a" author)
+         (:i :class "s7-note"))))))
 
 (defclass access-token ()
   ((access-token :accessor access-token-access-token
@@ -205,6 +205,14 @@
      (funcall ,func (aref ,list i))))
 
 
+(defun put-link (link-hash)
+  (unless (string= (gethash "_id" link-hash) (gethash "name" link-hash))
+    (setf (gethash "_id" link-hash) (gethash "name" link-hash)))
+  (handler-case
+      (mango:doc-put "reddit" (to-json link-hash))
+    (mango:unexpected-http-response (condition)
+      (declare (ignore condition))
+      nil)))
 
 (defmacro with-page ((&key
                       (title nil)
@@ -237,6 +245,7 @@
                                             :padding-top "30px"
                                             :height "0"
                                             :overflow "hidden"))
+                   ((".panel-heading") (:font-weight "400"))
                    ((".youtube-container iframe, .youtube-container object, .youtube-container embed")
                     (:position "absolute"
                      :top "0"
@@ -301,7 +310,8 @@
                                                      (string= (gethash "name" x) reddit-name))
                                                  reddit-subreddits))))
             (setf (gethash "type" reddit-hash) "subreddit")
-            (mango:doc-put "reddit" (to-json reddit-hash))
+            (put-link reddit-hash)
+            ;;(mango:doc-put "reddit" (to-json reddit-hash))
             (log:info "Missing ~a" (gethash "display_name" reddit-hash)))))
 
       ;; Remove db subreddits that aren't currently subscribed.
@@ -310,23 +320,9 @@
           (let ((stale-record (car (cq `(("name" . ,name))))))
             (mango:doc-delete "reddit" (gethash "_id" stale-record) (gethash "_rev" stale-record))
 
-            (log:info "Removing ~a" name)))))
+            (log:info "Removing ~a" name))))
+      (update-subreddits-cache))
     (log:info "Failed")))
-
-;; (defun make-history-url (subreddit first-id)
-;;   (format nil "https://www.reddit.com~anew.json?limit=100&before=~a"
-;;           (subreddit-url subreddit) (format nil "t3_~a" first-id)))
-
-;; (defmethod get-latest-link-for-subreddit ((subreddit subreddit))
-;;   (car (flatten
-;;         (with-pg (query (:limit (:order-by (:select 'id :from 'link
-;;                                              :where (:= 'subreddit (subreddit-display-name subreddit)))
-;;                                            (:asc 'created_utc))
-;;                                 1))))))
-
-;; (defun make-new-url (subreddit)
-;;   (format nil "~anew/.json?limit=100" (subreddit-url subreddit)))
-
 
 (defun is-repostp (link-hash)
   (< 0 (length
@@ -340,13 +336,14 @@
              (setf (gethash "type" link-hash) "link")
              (setf (gethash "_id" link-hash) (gethash "_id" existing-link))
              (setf (gethash "_rev" link-hash) (gethash "_rev" existing-link))
+             (setf (gethash "shadow" link-hash) nil)
              (setf (gethash "scores" link-hash) (append (gethash "scores" existing-link)
                                                         (list (gethash "score" link-hash))))
              (if (gethash "hidden" existing-link)
                (setf (gethash "hidden" link-hash)
                      (gethash "hidden" existing-link))
                (setf (gethash "hidden" link-hash) nil))
-             (mango:doc-put "reddit" (to-json link-hash)))
+             (put-link link-hash))
            (unless (gethash "hidden" link-hash nil)
              (send-update-graph link-hash)))
 
@@ -358,7 +355,7 @@
       (setf (gethash "hidden" link-hash) nil)
       (setf (gethash "scores" link-hash) (list (gethash "score" link-hash)
                                                (gethash "score" link-hash)))
-      (mango:doc-put "reddit" (to-json link-hash))
+      (put-link link-hash)
       (add-seen (gethash "name" link-hash))
       (#+lispworks mp:mailbox-send
        #+sbcl sb-concurrency:send-message
@@ -366,8 +363,9 @@
        (to-json (alist-hash-table
                  (list (cons "name" (gethash "name" link-hash))
                        (cons "action" "add-link")))))
-      (send-update-graph link-hash))))
-
+      (send-update-graph link-hash)
+      ;;(update-link-comments link-hash)
+      )))
 
 (defun sync-subreddit (subreddit-hash)
   "Fetch the entire history of this subreddit."
@@ -415,7 +413,6 @@
         (t (log:info "Connecting to reddit failed with: ~a for ~a"
                      code (gethash "display_name" subreddit-hash)))))))
 
-
 (defun send-update-graph (link-hash)
   (let ((package (to-json (alist-hash-table
                            (list (cons "name" (gethash "_id" link-hash))
@@ -423,50 +420,35 @@
     #+lispworks (mp:mailbox-send *mailbox* package)
     #+sbcl (sb-concurrency:send-message *mailbox* package)))
 
-;; (defun update-all-graphs ()
-;;   (dolist (link (with-pg (select-dao 'link (:= 'hidden nil))))
-;;     (send-update-graph link)))
-
-
-;; (defgeneric update-link-comments (link &key refresh))
+(defun add-or-update-comment (comment-hash)
+  (dolist (comment (cq `(("name" . ,(gethash "name" comment-hash)))))
+    (mango:doc-delete "reddit" (gethash "_id" comment) (gethash "_rev" comment)))
+  (mango:doc-put "reddit" (to-json comment-hash))
+  (dolist (reply (ignore-errors (hu:hash-get comment-hash '("replies" "data" "children"))))
+    (when (string= "t1" (gethash "kind" reply))
+      (add-or-update-comment (gethash "data" reply)))))
 
 (defun update-link-comments (link &key (refresh t))
-  (unless (and (< 0 (length (cq (list (cons "parent_id" (gethash "name" link)))
-                                :limit 1
-                                :fields (list "_id"))))
-               (not refresh))
-    (multiple-value-bind (data code)
-        (handler-case (get-reddit (format nil "~acomments.json"
-                                          (gethash "permalink" link)) :retry nil)
-          (flexi-streams:external-format-encoding-error (condition)
-            (log:info "ENCODING ERROR: ~a" condition)
-            (values 201 "NOTHING")))
-      (switch (code)
-        (200 (dolist (comment-hash (yason:parse data))
-               (let ((the-listing (ignore-errors (hu:hash-get comment-hash '("data" "children")))))
-                 (dolist (listing the-listing)
-                   (when (string= (gethash "kind" listing) "t1")
-                     (add-or-update-comment (gethash "data" listing)))))))
-        (t nil)))))
-
-;; (defmethod update-comment-votes ((comment comment)
-;;                                  (id string)
-;;                                  (count integer))
-;;   (if-let ((maybe-votes (with-pg (get-dao 'comment-votes id))))
-;;     (progn
-;;       (let ((votes (make-array (length (comment-votes-scores maybe-votes))
-;;                                :initial-contents (comment-votes-scores maybe-votes)
-;;                                :adjustable t
-;;                                :fill-pointer t)))
-;;         (vector-push-extend count votes)
-;;         (setf (comment-votes-scores maybe-votes) votes)
-;;         (with-pg (update-dao maybe-votes))))
-;;     (with-pg (insert-dao (make-instance 'comment-votes
-;;                                         :id id
-;;                                         :scores (vector count))))))
-
-
-
+  (multiple-value-bind (data code)
+      (handler-case (get-reddit (format nil "~acomments.json"
+                                        (gethash "permalink" link)) :retry nil)
+        (flexi-streams:external-format-encoding-error (condition)
+          (log:info "ENCODING ERROR: ~a" condition)
+          (values 201 "NOTHING")))
+    (switch (code)
+      (200 (dolist (comment-hash (yason:parse data))
+             (let ((the-listing (ignore-errors (hu:hash-get comment-hash '("data" "children")))))
+               (dolist (listing the-listing)
+                 (if (string= (gethash "kind" listing) "t1")
+                   (add-or-update-comment (gethash "data" listing))
+                   (cond ((string= "more" (gethash "kind" listing)) (log:info "More: ~a ~a"
+                                                                              (alexandria:hash-table-keys
+                                                                               (gethash "data" listing))
+                                                                              (hu:hash-get listing
+                                                                                           '("data" "count"))))
+                         (t nil ;;(log:info "Comment kind not t1: ~a" (gethash "kind" listing))
+                            )))))))
+      (t (log:info "Fetching comments got: ~a" code)))))
 
 (defun update-subreddit (subreddit)
   (let ((yason:*parse-json-booleans-as-symbols* nil))
@@ -490,25 +472,18 @@
   (cl-ivy:stop-thread-by-name "fetchers"))
 
 (defun mark-subreddit-as-read (subreddit-display-name)
-  (let ((subreddit (car (cq (list (cons "display_name" subreddit-display-name)
+  (when-let ((subreddit (car (cq (list (cons "display_name" subreddit-display-name)
                                   (cons "type" "subreddit"))
                             :limit 1
                             :fields (list "name")))))
     (let ((links (cq (list (cons "subreddit_id" (gethash "name" subreddit))
-                            (cons "type" "link")
-                            (cons "hidden" nil))
+                           (cons "type" "link")
+                           (cons "hidden" nil))
                      :limit 100000)))
       (dolist (link links)
         (setf (gethash "hidden" link) t)
-        (mango:doc-put "reddit" (to-json link)))
+        (put-link link))
       (length links))))
-
-;; (defmethod mark-subreddit-as-unread ((subreddit subreddit))
-;;   (with-slots (display-name) subreddit
-;;     (dolist (link (with-pg (select-dao 'link (:and (:= 'subreddit display-name)
-;;                                                    (:= 'hidden t)))))
-;;       (setf (link-hidden link) nil)
-;;       (with-pg (update-dao link)))))
 
 (defun display-link (link-hash &key (public))
   (let ((name (gethash "name" link-hash)))
@@ -519,56 +494,55 @@
            :style "border:1px solid rgb(7,7,7);"
            (:div :class "panel-heading" :style "font-size:14px;padding: 15px 15px 10px;"
              (unless public
-               (:div.tools
-                (:div.icon (:a :id (format nil "hider-~a" unique-id)
-                             (:i :class "s7-look")))
-                (:script
-                  (ps:ps*
-                   `(-> (sel ,(format nil "#hider-~a" unique-id))
-                        (click (lambda (e)
-                                 (-> (sel ,(format nil "#link-~a" unique-id))
-                                     (toggle))
-                                 (-> e (prevent-default)))))))
-                (make-author-link link-hash)
-                (:a :style "font-weight:bold;"
-                  :target (format nil "win-~a" unique-id)
-                  :href (format nil "/link/~a" unique-id)
-                  (:div.icon (:span.s7-id)))
+               (:div.tools (:div.icon (:a :id (format nil "hider-~a" unique-id)
+                                        (:i :class "s7-look")))
+                           (:script
+                             (ps:ps*
+                              `(-> (sel ,(format nil "#hider-~a" unique-id))
+                                   (click (lambda (e)
+                                            (-> (sel ,(format nil "#link-~a" unique-id))
+                                                (toggle))
+                                            (-> e (prevent-default)))))))
+                           (make-author-link link-hash)
+                           (:a :style "font-weight:bold;"
+                             :target (format nil "win-~a" unique-id)
+                             :href (format nil "/link/~a" unique-id)
+                             (:div.icon (:span.s7-id)))
 
-                (:div.icon (:a :id (format nil "shadow-~a" unique-id)
-                             (:i :class "s7-trash")))
-                (:script
-                  (ps:ps*
-                   `(-> (sel ,(format nil "#shadow-~a" unique-id))
-                        (click (lambda (e)
-                                 (-> (sel ,(format nil "#wx~a" unique-id)) (toggle))
-                                 (-> (sel ,(format nil "#wx~a" unique-id)) (load ,(format nil "/shadow/~a" unique-id)))
-                                 (-> e (prevent-default)))))))
+                           (:div.icon (:a :id (format nil "shadow-~a" unique-id)
+                                        (:i :class "s7-trash")))
+                           (:script
+                             (ps:ps*
+                              `(-> (sel ,(format nil "#shadow-~a" unique-id))
+                                   (click (lambda (e)
+                                            (-> (sel ,(format nil "#wx~a" unique-id)) (toggle))
+                                            (-> (sel ,(format nil "#wx~a" unique-id)) (load ,(format nil "/shadow/~a" unique-id)))
+                                            (-> e (prevent-default)))))))
 
-                (:div.icon :id (format nil "favorite-~a" unique-id)
-                           (:span.s7-download))
-                (:div.icon :id (format nil "hide-~a" unique-id)
-                           (:span.s7-close-circle))
-                (let ((llt (gethash "link_flair_text" link-hash)))
-                  (when (and llt
-                             ;; WTF IS THIS
-                             (not (string= "false" llt)))
-                    (let ((background-color (if-let ((bg-color (let ((wuzit (gethash "link_flair_background_color" link-hash)))
-                                                                 (and (< 0 (length wuzit))
-                                                                      wuzit))))
-                                              bg-color
-                                              "orange"))
-                          (color (if-let ((tcolor (gethash "link_flair_text_color" link-hash)))
-                                   (if (string= "dark" tcolor)
-                                     "black"
-                                     tcolor))))
-                      (:br)
-                      (:span :class "label pull-right"
-                        :style (format nil "font-size:10px;background-color:~a;color:~a"
-                                       background-color color)
-                        (ppcre:regex-replace-all "&amp;"
-                                                 (gethash "link_flair_text" link-hash)
-                                                 "&")))))))
+                           (:div.icon :id (format nil "favorite-~a" unique-id)
+                                      (:span.s7-download))
+                           (:div.icon :id (format nil "hide-~a" unique-id)
+                                      (:span.s7-close-circle))
+                           (let ((llt (gethash "link_flair_text" link-hash)))
+                             (when (and llt
+                                        ;; WTF IS THIS
+                                        (not (string= "false" llt)))
+                               (let ((background-color (if-let ((bg-color (let ((wuzit (gethash "link_flair_background_color" link-hash)))
+                                                                            (and (< 0 (length wuzit))
+                                                                                 wuzit))))
+                                                         bg-color
+                                                         "orange"))
+                                     (color (if-let ((tcolor (gethash "link_flair_text_color" link-hash)))
+                                              (if (string= "dark" tcolor)
+                                                "black"
+                                                tcolor))))
+                                 (:br)
+                                 (:span :class "label pull-right"
+                                   :style (format nil "font-size:10px;background-color:~a;color:~a"
+                                                  background-color color)
+                                   (ppcre:regex-replace-all "&amp;"
+                                                            (gethash "link_flair_text" link-hash)
+                                                            "&")))))))
              (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
                :href (gethash "url" link-hash)
                (html-entities:decode-entities
@@ -660,14 +634,6 @@
                              (bt:all-threads))
           :test #'string=))
 
-;; (defun mark-everything-unread ()
-;;   (dolist (subreddit (with-pg (select-dao 'subreddit)))
-;;     (mark-subreddit-as-unread (subreddit-display-name subreddit))))
-
-;; (defun mark-everything-read ()
-;;   (dolist (subreddit (with-pg (select-dao 'subreddit)))
-;;     (mark-subreddit-as-read subreddit)))
-
 (defparameter *display-offset* nil)
 
 (defmacro links-page (&rest body)
@@ -675,12 +641,12 @@
      (:div :class "row"
        (:div :class "col-md-12"
          (:form :method :post :action "/search"
-           (:div :class "col-md-3"
+           (:div :class "col-md-2"
              (:div :class "btn-group btn-space"
+               (:a :class "btn btn-default btn-xs" :type "button" :href "/live" "Live")
                (:a :class "btn btn-default btn-xs"
                  :type "button" :href "/favorites" "Favorites")
-               (:a :class "btn btn-default btn-xs" :type "button" :href "/live" "Live")
-               (:a.btn.btn-default.btn-xs :type "button" :href "/mine" :target "mineminemine" "Mine")
+               ;;(:a.btn.btn-default.btn-xs :type "button" :href "/mine" :target "mineminemine" "Mine")
 
                (:a :class "btn btn-default btn-xs" :id "hidebutton" :type "button" :href "#" "C")
                (:script (ps:ps (-> (sel "#hidebutton")
@@ -699,16 +665,18 @@
                  (:a :class "btn btn-default btn-xs"
                    :type "button" :href "/start-fetchers" "Start Collectors"))
 
-               (:input :name "pattern" :type "text"
-                 :class "input-xs form-control pull-left" :placeholder "Search..." :id "searchtext"))))
-         (:div :class "col-md-9"
+               ;; (:input :name "pattern" :type "text"
+               ;;   :class "input-xs form-control pull-left" :placeholder "Search..." :id "searchtext")
+               )))
+         (:div :class "col-md-10"
            (:div :class "btn-group btn-space"
              (dolist (subreddit *subreddits-cache*)
                (:a
                  :target (format nil "wx~a" (gethash "name" subreddit))
                  :class "btn btn-primary btn-xs"
                  :href (format nil "/subreddit/~a/0" (gethash "name" subreddit))
-                 (gethash "display_name" subreddit)))))))
+                 (gethash "display_name" subreddit))))))
+       )
      ,@body
      (:script
        (:raw
@@ -744,9 +712,9 @@
     (:span.pull-left
      (:a.pull-left :style "padding-left:5px;" :href (format nil "https://reddit.com/u/~a" (gethash "author" comment))
                    (gethash "author" comment))
-     (when-let ((total-awards (gethash "total_awards_received" comment))
-                (gilded (gethash "gilded" comment)))
-       (:div.pull-left :style "padding-right:5px;padding-left:5px;" (format nil " (~a/~a)" gilded total-awards)))
+     (:div.pull-left :style "padding-left:5px;"
+                     (make-author-link-from-comment comment))
+
      (dolist (award (gethash "all_awardings" comment))
        (:img.pull-left
         :style "max-height:17px;"
@@ -764,13 +732,6 @@
       (:div :style "border-left:1px solid darkgrey;padding-left:5px;"
         (display-comment reply)))))
 
-(defun add-or-update-comment (comment-hash)
-  (dolist (comment (cq `(("name" . ,(gethash "name" comment-hash)))))
-    (mango:doc-delete "reddit" (gethash "_id" comment) (gethash "_rev" comment)))
-  (mango:doc-put "reddit" (to-json comment-hash))
-  (dolist (reply (ignore-errors (hu:hash-get comment-hash '("replies" "data" "children"))))
-    (when (string= "t1" (gethash "kind" reply))
-      (add-or-update-comment (gethash "data" reply)))))
 
 (defclass user (hunchensocket:websocket-client)
   ((name :initarg :user-agent
@@ -851,24 +812,6 @@
   (dolist (subreddit (cq '(("type" . "subreddit"))))
     (sync-subreddit subreddit)))
 
-;; (defun mark-everything-older-than-a-month-as-read ()
-;;   (dolist (linkid (flatten
-;;                    (with-pg (query (:order-by (:select 'id :from 'link :where
-;;                                                 (:and (:= 'hidden nil)
-;;                                                       (:>= (- (cl-ivy:epoch-time) (* 2 24 60 60))
-;;                                                            'created_utc)))
-;;                                               (:desc 'created_utc))))))
-;;     (let ((the-link (with-pg (get-dao 'link linkid))))
-;;       (setf (link-hidden the-link) t)
-;;       (with-pg (update-dao the-link)))))
-
-;; (defun start-comment-update-thread ()
-;;   (bt:make-thread (lambda ()
-;;                     (get-all-the-damned-comments))
-;;                   :name "comment fetcher"))
-
-
-
 (defroute stop-threads ("/stop-fetchers") ()
   (stop-refresh-threads)
   (hunchentoot:redirect "/live"))
@@ -877,36 +820,25 @@
   (start-refresh-threads)
   (hunchentoot:redirect "/live"))
 
-;; (defroute get-votes ("/votes/:id") ()
-;;   (setf (hunchentoot:content-type*) "application/json")
-;;   (if-let ((up-history (with-pg (get-dao 'up-history id))))
-;;     (with-output-to-string (sink)
-;;       (yason:encode (up-history-scores up-history) sink))
-;;     "[]"))
-
-;; (defroute show-author ("/author/:author") ()
-;;   (display-links (with-pg (query (:order-by
-;;                                   (:select '* :from 'link :where (:= 'author author))
-;;                                   (:desc 'created-utc))
-;;                                  (:dao link)))))
-
-;; (defroute display-single-link ("/link/:id") ()
-;;   (with-page ()
-;;     (display-link (with-pg (get-dao 'link id)) :public t)))
-
 (defroute display-subreddit ("/subreddit/:subid/:offset" :method :get) ()
-  (let* ((offset-i (parse-integer offset))
-         (*display-offset* (+ offset-i 500)))
+  (let* ((offset-i (or (parse-integer offset) 0))
+         (*display-offset* (+ offset-i 100)))
     (display-links
-     (cq `(("type" . "link")
-           ("subreddit_id" . ,subid))
+     (cq (list (cons "type" "link")
+          (cons "$or" (list (alist-hash-table
+                             (list (cons "shadow" (alist-hash-table
+                                                   (list (cons "$exists" 'yason:false))))))
+                            (alist-hash-table
+                             (list (cons "shadow" 'yason:false)))))
+          (cons "subreddit_id" subid))
          :skip offset-i
-         :limit 500
+         :limit 100
          :sort (list (alist-hash-table
                       (list (cons "created_utc" "desc"))))))))
 
 (defroute favorites ("/favorites") ()
-  (display-links (cq '(("favorite" . t))
+  (display-links (cq '(("favorite" . t)
+                       ("type" . "link"))
                      :sort (list
                             (alist-hash-table
                              (list (cons "created_utc" "desc")))))))
@@ -915,23 +847,44 @@
   (when-let ((link (yason:parse (mango:doc-get "reddit" id))))
     (setf (gethash "shadow" link) t)
     (setf (gethash "hidden" link) t)
-    (mango:doc-put "reddit" (to-json link))
+    (put-link link)
     (with-html-string (:div "ok"))))
 
 (defroute index ("/") ()
   (hunchentoot:redirect "/live"))
 
 (defroute hide-link ("/link/hide/:id") ()
-  (when-let ((link (yason:parse (mango:doc-get "reddit" id))))
-    (setf (gethash "hidden" link) t)
-    (mango:doc-put "reddit" (to-json link))
-    "ok"))
+  (handler-case
+      (when-let ((link (yason:parse (mango:doc-get "reddit" id))))
+        (setf (gethash "hidden" link) t)
+        (put-link link)
+        "ok")
+    (mango:unexpected-http-response (condition)
+      (log:info condition)
+      nil)))
 
 (defroute make-favorite ("/link/favorite/:id") ()
-  (when-let ((link (yason:parse (mango:doc-get "reddit" id))))
-    (setf (gethash "favorite" link) t)
-    (setf (gethash "hidden" link) t)
-    (mango:doc-put "reddit" (to-json link))
+  (when-let ((document (handler-case (mango:doc-get "reddit" id)
+                         (mango:unexpected-http-response (condition)
+                           (declare (ignore condition))
+                           nil))))
+    (let ((link (yason:parse document)))
+      (setf (gethash "favorite" link) t)
+      (setf (gethash "hidden" link) t)
+      (put-link link)
+      ;;(mango:doc-put "reddit" (to-json link))
+      "ok")))
+
+(defroute make-favorite ("/link/favorite/name/:name") ()
+  (when-let ((document (handler-case (car (cq `(("type" . "link")
+                                                ("name" . ,name))))
+                         (mango:unexpected-http-response (condition)
+                           (declare (ignore condition))
+                           nil))))
+    (setf (gethash "favorite" document) t)
+    (setf (gethash "hidden" document) t)
+    (put-link document)
+    ;;(mango:doc-put "reddit" (to-json document))
     "ok"))
 
 (defroute show-comments ("/comments/:name") ()
@@ -939,7 +892,9 @@
                               ("name" . ,name))))))
     (update-link-comments link)
 
-    (if-let ((comments (cq `(("parent_id" . ,(gethash "name" link))))))
+    (if-let ((comments (cq `(("parent_id" . ,(gethash "name" link)))
+                           :sort (list (alist-hash-table
+                                        (list (cons "score" "desc")))))))
       (with-html-string
         (dolist (comment comments)
           (display-comment comment)))
@@ -1114,13 +1069,6 @@
         (render-link has-crosspost-parent)
         (render-link link)))))
 
-;; (defroute comment-history ("/graph/comment/history/:id") ()
-;;   (setf (hunchentoot:content-type*) "application/json")
-;;   (if-let ((history (with-pg (get-dao 'comment-votes id))))
-;;     (with-output-to-string (sink)
-;;       (yason:encode (comment-votes-scores history) sink))
-;;     "[]"))
-
 (defroute make-history ("/graph/history/:id") ()
   (setf (hunchentoot:content-type*) "application/json")
   (if-let ((link (handler-case
@@ -1132,31 +1080,18 @@
       (yason:encode (gethash "scores" link) sink))
     "[]"))
 
-;; (defroute make-graph ("/graph/:id") ()
-;;   (with-html-string
-;;     (:div :class "col-md-3"
-;;       (:div :id (format nil "graph~a" id)))))
-
 (defroute ajax-link ("/singlelink/:name") ()
   (with-html-string
     (display-link
      (car (cq `(("name" . ,name)))))))
 
-;; (defroute authors-comments ("/comments/author/:author") ()
-;;   (with-page ()
-;;     (dolist (comment (with-pg (select-dao 'comment (:= 'author author))))
-;;       (:div :class "col-md-6 col-md-offset-3" :style "padding-top:10px;padding-bottom:10px;margin-bottom:10px;background:white;"
-;;         (display-comment comment)))))
-
-;; (defroute mine ("/mine") ()
-;;   (display-links
-;;    (sort (mapcar (lambda (realid)
-;;                    (with-pg (get-dao 'link (ppcre:regex-replace "^t3_" realid ""))))
-;;                  (remove-duplicates
-;;                   (remove-if-not (lambda (thing)
-;;                                    (ppcre:scan "^t3_" thing))
-;;                                  (flatten (with-pg (query (:select 'parent :from 'comment :where (:= 'author "clintm"))))))))
-;;          #'> :key #'link-created-utc)))
+(defroute authors-comments ("/comments/author/:author") ()
+  (with-page ()
+    (dolist (comment (cq `(("parent_id" . ,(alist-hash-table
+                                            (list (cons "$exists" 'yason:true))))
+                           ("author" . ,author))))
+      (:div :class "col-md-6 col-md-offset-3" :style "padding-top:10px;padding-bottom:10px;margin-bottom:10px;background:white;"
+        (display-comment comment)))))
 
 (defroute live ("/live") ()
   (links-page
@@ -1235,104 +1170,39 @@
                (lambda ()
                  (ws-connect))))))))))
 
-;; (defun get-links-by-text (searchtext)
-;;   (with-pg
-;;     (query (:select '* :from 'link
-;;              :where (:and (:= 'shadow nil)
-;;                           (:raw (format nil "to_tsvector('english',title) @@ to_tsquery('english','~a')"
-;;                                         searchtext))))
-;;            (:dao link))))
-
-;; (defroute search-h ("/search" :method :post) (pattern)
-;;   (log:info "Searching... ~a" pattern)
-;;   (links-page
-;;    (dolist (link (get-links-by-text pattern))
-;;      (display-link link))))
-
 (defun start ()
   (start-server)
   ;;(start-refresh-threads)
   (start-ws-server)
   (start-ws-reader-thread))
 
+(defun handle-link-update (link-id)
+  (let ((link (yason:parse (mango:doc-get "reddit" (gethash "_id" link-id)))))
+    (update-link-comments link)
+    (sleep 1)))
 
-
-
-
-
-
-
-
-
-
-;; (defun update-types ()
-;;   (dolist (document-id (hash-extract "_id"
-;;                                      (cq `(("type" . (alist-hash-table
-;;                                                       (list (cons "$exists" 'yason:false)))))
-;;                                          :limit 200000
-;;                                          :fields (list "_id"))))
-;;     (let* ((document (yason:parse (mango:doc-get "reddit" document-id)))
-;;            (pattern (gethash "name" document))
-;;            (type (cond ((ppcre:scan "^t5_*" pattern) "subreddit")
-;;                        ((ppcre:scan "^t6_*" pattern) "award")
-;;                        ((ppcre:scan "^t4_*" pattern) "message")
-;;                        ((ppcre:scan "^t3_*" pattern) "link")
-;;                        ((ppcre:scan "^t2_*" pattern) "account")
-;;                        ((ppcre:scan "^t1_*" pattern) "comment")
-;;                        (t (error "WTF IS THIS")))))
-;;       (setf (gethash "type" document) type)
-;;       (mango:doc-put "reddit" (to-json document)))))
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-(defun copy-old-articles ()
+(defun grab-link-comments ()
   (declare (optimize (debug 3)))
-  (with-open-file (reader "bulks.json")
-    (do ((line (read-line reader)))
-        (nil)
-      (if line
-        (let* ((parsed (yason:parse (ppcre:regex-replace-all "\\\\\\\\" line "\\\\")))
-               (this-bulk (gethash "bulk" parsed))
-               (document-hash (yason:parse this-bulk))
-               (document-on-couch (car (cq `(("name" . ,(gethash "name" document-hash)))))))
-          (if document-on-couch
-            (progn
-              (destructuring-bind (favorite hidden shadow)
-                  (list (gethash "favorite" document-hash)
-                        (gethash "hidden" document-hash)
-                        (gethash "shadow" document-hash))
-                (when (or favorite hidden shadow)
-                  (setf (gethash "favorite" document-on-couch) favorite)
-                  (setf (gethash "hidden" document-on-couch) hidden)
-                  (setf (gethash "shadow" document-on-couch) shadow)
-                  (mango:doc-put "reddit" (to-json document-on-couch)))))
-            (progn
-              (mango:doc-put "reddit" (to-json document-hash))
-              (log:info "IS NOT on couch"))))
-        (return)))))
+  (dolist (link-id (cq '(("type" . "link"))
+                       :fields (list "_id")
+                       :limit 400000))
+    (handle-link-update link-id)))
+
+(defun convert-all-docs ()
+  (dolist (link-id (cq '(("type" . "link"))
+                       :fields (list "_id" "_rev")
+                       :limit 400000))
+    (let ((document (yason:parse
+                     (mango:doc-get "reddit" (gethash "_id" link-id)))))
+      (unless (string= (gethash "_id" document)
+                       (gethash "name" document))
+        (restart-case (progn
+                        (setf (gethash "_id" document) (gethash "name" document))
+                        (remhash "_rev" document)
+                        (mango:doc-delete "reddit" (gethash "_id" link-id) (gethash "_rev" link-id))
+                        (put-link document)
+                        ;;(mango:doc-put "reddit" (to-json document))
+                        )
+          (skip-this-one (thingy)
+            (declare (ignore thingy))
+            nil))))))
