@@ -95,16 +95,14 @@
                        :if-exists :supersede)
     (print *config* out)))
 
-
+(defun read-config (&key (filename (asdf:system-relative-pathname "sup" "config.sexp")))
+  (setf *config*
+        (with-open-file (in filename :direction :input)
+          (let ((*read-eval* nil)
+                (*package* #.*package*))
+            (read in nil)))))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (defun read-config (filename)
-    (setf *config*
-          (with-open-file (in filename :direction :input)
-            (let ((*read-eval* nil)
-                  (*package* #.*package*))
-              (read in nil)))))
-  (read-config (asdf:system-relative-pathname "sup" "config.sexp"))
   (local-time:reread-timezone-repository)
   (setf local-time:*default-timezone*
         (local-time:find-timezone-by-location-name "America/Los_Angeles"))
@@ -444,7 +442,7 @@ found.
        ,results)))
 
 (defun authenticate ()
-  (destructuring-bind (&key client-id client-secret login password &allow-other-keys)
+  (destructuring-bind (&key client-id client-secret reddit-login reddit-password &allow-other-keys)
       *config*
     (handler-case
         (multiple-value-bind (result code)
@@ -454,8 +452,8 @@ found.
                                  :accept "application/json"
                                  :content-type "application/json"
                                  :parameters (list (cons "grant_type" "password")
-                                                   (cons "reddit-username" login)
-                                                   (cons "reddit-password" password))
+                                                   (cons "username" reddit-login)
+                                                   (cons "password" reddit-password))
                                  :method :post
                                  :preserve-uri t)
           (switch (code)
@@ -1642,7 +1640,8 @@ found.
 (defun check-image (filepath)
   (let* ((filename (path:basename filepath))
          (hash (car (ppcre:split "\\." (file-namestring filename)))))
-    (unless (with-pg (query (:select 'hash :from 'media :where (:= 'hash hash))))
+    (unless (or (ppcre:scan "git_keep" filename)
+                (with-pg (query (:select 'hash :from 'media :where (:= 'hash hash)))))
       (delete-file filepath)
       (log:info "Deleted ~a" filename))))
 
@@ -2343,6 +2342,7 @@ found.
 ;;       nil)))
 
 (defun start ()
+  (read-config)
   (start-server)
   (start-ws-server)
   (start-ws-reader-thread)
