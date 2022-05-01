@@ -2,8 +2,8 @@
 -- PostgreSQL database dump
 --
 
--- Dumped from database version 13.3
--- Dumped by pg_dump version 13.3
+-- Dumped from database version 14.1
+-- Dumped by pg_dump version 14.1
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -16,31 +16,6 @@ SET xmloption = content;
 SET client_min_messages = warning;
 SET row_security = off;
 
-DROP TRIGGER tsvectorupdate ON public.link;
-DROP INDEX public.up_history_id_index;
-DROP INDEX public.subreddit_id_index;
-DROP INDEX public.seen_id_index;
-DROP INDEX public.media_url_index;
-DROP INDEX public.media_link_id_url;
-DROP INDEX public.link_id_index;
-DROP INDEX public.comment_votes_id_index;
-DROP INDEX public.comment_id_index;
-ALTER TABLE ONLY public.up_history DROP CONSTRAINT up_history_pkey;
-ALTER TABLE ONLY public.subreddit DROP CONSTRAINT subreddit_pkey;
-ALTER TABLE ONLY public.seen DROP CONSTRAINT seen_pkey;
-ALTER TABLE ONLY public.media DROP CONSTRAINT media_pkey;
-ALTER TABLE ONLY public.link DROP CONSTRAINT link_pkey;
-ALTER TABLE ONLY public.comment_votes DROP CONSTRAINT comment_votes_pkey;
-ALTER TABLE ONLY public.comment DROP CONSTRAINT comment_pkey;
-ALTER TABLE public.media ALTER COLUMN id DROP DEFAULT;
-DROP TABLE public.up_history;
-DROP TABLE public.subreddit;
-DROP TABLE public.seen;
-DROP SEQUENCE public.media_id_seq;
-DROP TABLE public.media;
-DROP TABLE public.link;
-DROP TABLE public.comment_votes;
-DROP TABLE public.comment;
 SET default_tablespace = '';
 
 SET default_table_access_method = heap;
@@ -100,9 +75,6 @@ CREATE TABLE public.link (
     shadow boolean DEFAULT false NOT NULL,
     store text,
     remotefile text,
-    label_text text,
-    label_background_color text,
-    label_color text,
     ts_index tsvector NOT NULL
 );
 
