@@ -1,4 +1,5 @@
 *.?*~
 *.lisp~
 /images/*.?*
+/images/*.
 config.sexp

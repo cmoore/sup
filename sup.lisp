@@ -933,12 +933,18 @@ found.
                                                   (:asc 'created_utc))
                                        :column)))))
 
+(defmethod rescan-link ((link-id string))
+  (when-let ((link (with-pg (get-dao 'link link-id))))
+    (rescan-link link)))
+
+(defmethod rescan-link ((link link))
+  (when-let ((bulk (and (not (eq :null (link-bulk link)))
+                        (jsown:parse (link-bulk link)))))
+    (find-media (jsown:parse (link-bulk link)) (link-id link))))
+
 (defun rescan-media ()
   (dolist (link-id (with-pg (query (:select 'id :from 'link))))
-    (when-let* ((link (with-pg (get-dao 'link (car link-id))))
-                (bulk (and (not (eq :null (link-bulk link)))
-                           (jsown:parse (link-bulk link)))))
-      (find-media bulk (car link-id)))))
+    (rescan-link link-id)))
 
 (defroute handle-media ("/media/:id") ()
   (when-let ((media (with-pg (get-dao 'media id))))
