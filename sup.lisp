@@ -20,73 +20,6 @@
 
 (in-package :sup)
 
-
-;; The caching acceptor
-
-(defvar *storage-lock* (bt:make-lock "Storage Lock"))
-
-(defparameter *storage* (make-hash-table :test #'equal))
-
-(defstruct cached-file
-  content-type contents)
-
-
-(defun maybe-add-file (full-path)
-  (when (probe-file full-path)
-    (make-cached-file :content-type (hunchentoot:mime-type full-path)
-                      :contents (alexandria:read-file-into-byte-vector
-                                 full-path))))
-
-(defun orf-storage (filename base-dir)
-  (bt:with-lock-held (*storage-lock*)
-    (remhash filename *storage*)
-    (orf (gethash filename *storage*)
-         (maybe-add-file
-          (format nil "~a/~a" base-dir filename)))))
-
-(defun load-file (request-path base-dir)
-  (orf-storage request-path base-dir))
-
-(defun get-file (file base-dir)
-  (let ((filename-string (format nil "~a" file)))
-    (when (and base-dir
-               (< 0 (length filename-string)))
-      (orf-storage filename-string base-dir))))
-
-(defclass cache-acceptor (easy-routes:routes-acceptor)
-  ((package :initarg :package
-            :accessor cache-acceptor-package))
-  (:documentation "The static file cacherator"))
-
-(defvar *static-path*
-  (format nil "~a" (asdf:system-relative-pathname :sup "static")))
-
-(defmethod hunchentoot:acceptor-dispatch-request
-    ((acceptor cache-acceptor) request)
-  (alexandria:if-let ((file (get-file (hunchentoot:request-pathname request)
-                                      (asdf:system-relative-pathname
-                                       (slot-value acceptor 'package)
-                                       "static"))))
-    (progn
-      (setf (hunchentoot:content-length*) (length (cached-file-contents file)))
-      (setf (hunchentoot:content-type*)
-            (or (and (cached-file-content-type file)
-                     (hunchentoot::maybe-add-charset-to-content-type-header
-                      (cached-file-content-type file)
-                      (hunchentoot:reply-external-format*)))
-                "application/octet-stream"))
-      (let ((out (hunchentoot:send-headers)))
-        (write-sequence (cached-file-contents file) out)
-        (finish-output out)))
-    (handler-case
-        (call-next-method)
-      (error (condition)
-        (log:info condition)))))
-
-
-;; The actual application
-
-
 (defvar *config* nil)
 
 (defun write-config (filename)
@@ -474,7 +407,7 @@ found.
 
 (defun start-server (&key (port 9000))
   (unless *listener*
-    (setf *listener* (make-instance 'cache-acceptor
+    (setf *listener* (make-instance 'easy-routes:easy-routes-acceptor
                                     :access-log-destination nil
                                     :document-root (asdf:system-relative-pathname
                                                     :sup "static/am")
@@ -852,8 +785,7 @@ found.
                     (progn
                       (with-pg (insert-dao media))
                       (unless (media-exists-p media)
-                        (write-to-file media image)
-                        (log:info "wrote: ~a" linkid)))
+                        (write-to-file media image)))
                   (cl-postgres-error:unique-violation (condition)
                     (declare (ignore condition))
                     nil)))))))
