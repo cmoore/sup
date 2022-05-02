@@ -326,6 +326,7 @@
                (go retry))))))))
 
 (defun get-reddit (path)
+  (log:debug path)
   (raw-http-request (format nil "https://reddit.com~a" path)))
 
 (defmacro destructure-jsown-object (bind-list object &body body)
@@ -412,8 +413,7 @@ found.
                                     :document-root (asdf:system-relative-pathname
                                                     :sup "static/am")
                                     :port port
-                                    :address "0.0.0.0"
-                                    :package 'sup)))
+                                    :address "0.0.0.0")))
   (hunchentoot:start *listener*)
   (update-subreddits-cache))
 
@@ -627,15 +627,14 @@ found.
                  (when-let ((next-page (jsown:filter link "data" "after")))
                    (get-next-page next-page type))))))
     (dolist (type '(nil :top :controversial :new))
-      (when-let ((json-info (get-reddit (make-request-url subreddit :type type))))
-        (let ((parsed (jsown:parse json-info)))
-          (handle-this-block parsed)
-          (get-next-page (jsown:filter parsed "data" "after")
-                         type))))))
+      (let ((parsed (jsown:parse (get-reddit (make-request-url subreddit :type type)))))
+        (handle-this-block parsed)
+        (get-next-page (jsown:filter parsed "data" "after")
+                       type)))))
 
 (defmethod sync-subreddit ((subreddit-name string) &key reset)
-  (when-let ((subreddit (car (with-pg (query (:select '* :from 'subreddit
-                                               :where (:= 'display_name subreddit-name))
+  (let ((subreddit (car (with-pg (query (:select '* :from 'subreddit
+                                          :where (:= 'display_name subreddit-name))
                                         (:dao subreddit))))))
     (sync-subreddit subreddit :reset reset)))
 
@@ -651,12 +650,9 @@ found.
         (let ((path (make-request-url subreddit :type type)))
           (get-reddit path))
       (switch (code)
-        (200 (typecase data
-               (string (if-let ((json-data (safe-parse data)))
-                         (jsown:filter json-data "data" "children")
-                         (log:info "Links fetch was null? ~a" code)))
-               (list (progn (log:info "data from fetch was a list?")
-                            (flatten data)))))
+        (200 (if-let ((json-data (safe-parse data)))
+               (jsown:filter json-data "data" "children")
+               (log:info "Links fetch was null? ~a ~a" code (subreddit-display-name subreddit))))
         (t (log:info "Connecting to reddit failed with: ~a for ~a"
                      code (subreddit-display-name subreddit))
            (sleep 1))))))
@@ -671,9 +667,7 @@ found.
   (dolist (link (with-pg (select-dao 'link (:= 'hidden nil))))
     (send-update-graph link)))
 
-(defgeneric update-link-comments (link &key refresh))
-
-(defmethod update-link-comments ((link link) &key (refresh t))
+(defmethod update-link-comments ((link link) &key (refresh t) verbose)
   (unless (and (< 0 (length (with-pg (query (:limit (:select 'id :from 'comment
                                                       :where (:= 'parent (format nil "t3_~a" (link-id link))))
                                                     1)))))
@@ -692,6 +686,11 @@ found.
                    (when (string= kind "t1")
                      (add-or-update-comment data))))))
         (t nil)))))
+
+(defmethod update-link-comments ((link-id string) &key (refresh t) verbose)
+  (update-link-comments (with-pg (get-dao 'link link-id))
+                        :refresh refresh
+                        :verbose verbose))
 
 (defmethod update-comment-votes ((comment comment)
                                  (id string)
@@ -774,27 +773,25 @@ found.
           (unless (media-exists-p media)
             (when-let ((data (fetch-media url)))
               (write-to-file media data)))
-          (progn
-            (when-let ((image (fetch-media (or (ignore-errors (html-entities:decode-entities url))
-                                               url))))
-              (let ((media (make-instance 'media
-                                          :url url
-                                          :link-id linkid
-                                          :hash (cl-ivy:make-hash url))))
-                (handler-case
-                    (progn
-                      (with-pg (insert-dao media))
-                      (unless (media-exists-p media)
-                        (write-to-file media image)))
-                  (cl-postgres-error:unique-violation (condition)
-                    (declare (ignore condition))
-                    nil)))))))
+          (when-let ((image (fetch-media (or (ignore-errors (html-entities:decode-entities url))
+                                             url))))
+            (let ((media (make-instance 'media
+                                        :url url
+                                        :link-id linkid
+                                        :hash (cl-ivy:make-hash url))))
+              (handler-case
+                  (progn
+                    (with-pg (insert-dao media))
+                    (unless (media-exists-p media)
+                      (write-to-file media image)))
+                (cl-postgres-error:unique-violation (condition)
+                  (declare (ignore condition))
+                  nil))))))
     (error (condition)
       (log:info "media download failed: ~a" condition))))
 
 (defun media-download-worker ()
-  (let ((envelope (lparallel.queue:pop-queue *media-queue*)))
-    (handle-media-envelope envelope)))
+  (handle-media-envelope (lparallel.queue:pop-queue *media-queue*)))
 
 (defun start-media-worker ()
   (bt:make-thread (lambda ()
@@ -809,10 +806,10 @@ found.
       doc-obj
 
 
-    (when-let ((entries crosspost-parent-list))
+    (when crosspost-parent-list
       (let ((result (mapcar (lambda (entry)
                               (find-media entry link-id))
-                            entries)))
+                            crosspost-parent-list)))
         (return-from find-media result)))
 
     (when url
@@ -855,8 +852,7 @@ found.
   (let* ((link (with-pg (get-dao 'link id)))
          (json-string (link-bulk link)))
     (unless (eq json-string :null)
-      (when-let ((bulk (jsown:parse (link-bulk link))))
-        (find-media bulk id)))))
+      (find-media (jsown:parse (link-bulk link)) id))))
 
 (defun load-em-up ()
   (with-lparallel (:workers 4)
@@ -866,12 +862,11 @@ found.
                                        :column)))))
 
 (defmethod rescan-link ((link-id string))
-  (when-let ((link (with-pg (get-dao 'link link-id))))
-    (rescan-link link)))
+  (rescan-link (with-pg (get-dao 'link link-id))))
 
 (defmethod rescan-link ((link link))
-  (when-let ((bulk (and (not (eq :null (link-bulk link)))
-                        (jsown:parse (link-bulk link)))))
+  (let ((bulk (and (not (eq :null (link-bulk link)))
+                   (jsown:parse (link-bulk link)))))
     (find-media (jsown:parse (link-bulk link)) (link-id link))))
 
 (defun rescan-media ()
@@ -879,21 +874,21 @@ found.
     (rescan-link link-id)))
 
 (defroute handle-media ("/media/:id") ()
-  (when-let ((media (with-pg (get-dao 'media id))))
-    (let ((filename (media-path media)))
-      (if (probe-file filename)
-          (let* ((image-data (alexandria:read-file-into-byte-vector
-                              filename))
-                 (image-type (get-image-url-suffix (media-url media)))
-                 (content-type (switch (image-type :test #'string=)
-                                 ("jpg" "image/jpg")
-                                 ("png" "image/png")
-                                 ("gif" "image/gif")
-                                 (otherwise (log:info "WHAT IS THIS: ~a" image-type)
-                                            "image/jpg"))))
-            (setf (hunchentoot:content-type*) content-type)
-            image-data)
-          nil))))
+  (let* ((media (with-pg (get-dao 'media id)))
+         (filename (media-path media)))
+    (if (probe-file filename)
+        (let* ((image-data (alexandria:read-file-into-byte-vector
+                            filename))
+               (image-type (get-image-url-suffix (media-url media)))
+               (content-type (switch (image-type :test #'string=)
+                               ("jpg" "image/jpg")
+                               ("png" "image/png")
+                               ("gif" "image/gif")
+                               (otherwise (log:info "WHAT IS THIS: ~a" image-type)
+                                          "image/jpg"))))
+          (setf (hunchentoot:content-type*) content-type)
+          image-data)
+        nil)))
 
 (defun make-new-like-cache (link-obj)
   (destructure-jsown-object (id score)
@@ -984,10 +979,8 @@ found.
                                               ("action" . "remove-link")))
                               *interface-queue*))
 
-;;(hide-subreddit "oddlyterrifying")
 (defmethod hide-subreddit ((subreddit string))
-  (when-let ((sub (with-pg (select-dao 'subreddit (:= :display_name subreddit)))))
-    (hide-subreddit (car sub))))
+  (hide-subreddit (car (with-pg (select-dao 'subreddit (:= :display_name subreddit))))))
 
 (defmethod hide-subreddit ((subreddit subreddit))
   (dolist (link-id (with-pg (query (:select 'id :from 'link :where (:and (:= 'subreddit
@@ -1000,8 +993,7 @@ found.
     (send-hide-link link-id)))
 
 (defmethod show-subreddit ((subreddit string))
-  (when-let ((sub (with-pg (select-dao 'subreddit (:= :display_name subreddit)))))
-    (show-subreddit (car sub))))
+  (show-subreddit (car (with-pg (select-dao 'subreddit (:= :display_name subreddit))))))
 
 (defmethod show-subreddit ((subreddit subreddit))
   (dolist (id (with-pg (query (:select 'id :from 'link :where (:= 'subreddit (subreddit-display-name subreddit))))))
@@ -1019,8 +1011,7 @@ found.
         (handle-possible-new-link link)))))
 
 (defmethod update-subreddit ((subreddit-name string))
-  (when-let ((subreddit (with-pg (select-dao 'subreddit (:= 'display-name subreddit-name)))))
-    (update-subreddit (car subreddit))))
+  (update-subreddit (car (with-pg (select-dao 'subreddit (:= 'display-name subreddit-name))))))
 
 
 (defun scan-subreddits ()
@@ -1049,10 +1040,9 @@ found.
       (with-pg (update-dao link)))))
 
 (defmethod mark-subreddit-as-read ((subreddit-name string))
-  (let ((subreddit (car (with-pg (query
-                                  (:select '* :from 'subreddit :where (:= 'display_name subreddit-name))
-                                  (:dao subreddit))))))
-    (mark-subreddit-as-read subreddit)))
+  (mark-subreddit-as-read (car (with-pg (query
+                                         (:select '* :from 'subreddit :where (:= 'display_name subreddit-name))
+                                         (:dao subreddit))))))
 
 (defmethod mark-subreddit-as-unread ((subreddit subreddit))
   (with-slots (display-name) subreddit
@@ -1069,62 +1059,12 @@ found.
 
 (defgeneric display-link (link))
 
-;; (defmethod display-link ((item item))
-;;   (with-slots (type title by id)
-;;       item
-;;     (when (string= type "story")
-;;       (let ((unique-id (format nil "~a" id)))
-;;         (with-html
-;;           (:div :class "col-md-4 post" :id (format nil "wx~a" id)
-;;             (:div.panel.panel-default.panel-borders.panel-heading-fullwidth
-;;              :style "border:1px solid rgb(7,7,7);"
-;;              (:div :class "panel-heading"
-;;                :style "font-size:11px;padding: 15px 15px 10px;"
-;;                (:div :class "tools"
-;;                  (:div :class "icon"
-;;                    (:a :id (format nil "hider-~a" unique-id)
-;;                      (:i :class "s7-look")))
-;;                  (:script
-;;                    (:raw
-;;                     (ps:ps*
-;;                      `(-> (sel ,(format nil "#hider-~a" unique-id))
-;;                           (click (lambda (e)
-;;                                    (-> (sel ,(format nil "#link-~a" unique-id))
-;;                                        (toggle))
-;;                                    (-> e (prevent-default))))))))
-;;                  by
-;;                  (:a :style "font-weight:bold;"
-;;                    :target (format nil "win-~a" unique-id)
-;;                    :href (format nil "/link/~a" id)
-;;                    (:div.icon (:span.s7-id)))
-;;                  (:a :style "font-weight:bold;"
-;;                    :target (format nil "json-~a" unique-id)
-;;                    :href (format nil "/json/~a" id)
-;;                    (:div :class "icon" (:i :class "s7-safe")))
-;;                  (:a :id (format nil "shadow-~a" unique-id)
-;;                    (:div :class "icon" (:i :class "s7-trash")))
-;;                  (:script
-;;                    (:raw
-;;                     (ps:ps*
-;;                      `(-> (sel ,(format nil "#shadow-~a" unique-id))
-;;                           (click (lambda (e)
-;;                                    (-> (sel ,(format nil "#wx~a" unique-id)) (toggle))
-;;                                    (-> (sel ,(format nil "#wx~a" unique-id)) (load ,(format nil "/shadow/~a" id)))
-;;                                    (-> e (prevent-default))))))))
-
-;;                  (:div.icon :id (format nil "favorite-~a" unique-id)
-;;                             (:span.s7-download))
-;;                  (:div.icon :id (format nil "hide-~a" unique-id)
-;;                             (:span.s7-close-circle)))
-;;                title " by " by))))))))
-
 (defmethod display-link ((link-id string))
-  (when-let ((link (with-pg (get-dao 'link link-id))))
-    (display-link link)))
+  (display-link (with-pg (get-dao 'link link-id))))
 
 
 (defroute handle-awards ("/awards/:id") ()
-  (when-let ((link (with-pg (get-dao 'link id))))
+  (let ((link (with-pg (get-dao 'link id))))
     (let ((doc-obj (jsown:parse (link-bulk link))))
       (with-html-string
         (dolist (award (jsown:val doc-obj "all_awardings"))
@@ -1418,26 +1358,29 @@ found.
                                 (parent-id "parent_id")
                                 (author-flair-text "author_flair_text")
                                 (body-html "body_html")
-                                (body-text "body_text" :safe))
+                                (body-text "body_text" :safe)
+                                subreddit)
       comment-obj
     (when-let ((db-comment (with-pg (get-dao 'comment id))))
       (with-pg (delete-dao db-comment)))
-    (let ((new-comment (make-instance 'comment
-                                      :id id
-                                      :parent parent-id
-                                      :score score
-                                      :link-id id
-                                      :flair-text (if (string= author-flair-text
-                                                               "false")
-                                                      nil
-                                                      author-flair-text)
-                                      :author author
-                                      :bulk (jsown:to-json comment-obj)
-                                      :body-html (or body-html
-                                                     body-text
-                                                     body))))
+    (let* ((comment-text (or body-html
+                             body-text
+                             body))
+           (new-comment (make-instance 'comment
+                                       :id id
+                                       :parent parent-id
+                                       :score score
+                                       :link-id id
+                                       :flair-text (if (string= author-flair-text
+                                                                "false")
+                                                       nil
+                                                       author-flair-text)
+                                       :author author
+                                       :bulk (jsown:to-json comment-obj)
+                                       :body-html comment-text)))
       (with-pg (insert-dao new-comment))
-      (update-comment-votes new-comment id score))
+      (update-comment-votes new-comment id score)
+      (log:debug "~a ~a : ~a" author subreddit comment-text))
     (dolist (reply (ignore-errors (jsown:filter replies "data" "children")))
       (destructure-jsown-object (kind data)
           reply
@@ -1448,31 +1391,28 @@ found.
 
 (defun link-hidden-p (link-id)
   (ivy:orf (gethash link-id *seen-comments*)
-       (caar (with-pg (query (:select 'hidden :from 'link
-                               :where (:= 'id (ppcre:regex-replace "^t3_" link-id ""))))))))
+           (caar (with-pg (query (:select 'hidden :from 'link
+                                   :where (:= 'id (ppcre:regex-replace "^t3_" link-id ""))))))))
 
 (defun has-commentp (comment-id)
   (ivy:orf (gethash comment-id *seen-comments*)
        (< 0 (caar (with-pg (query (:select (:count '*) :from 'comment :where (:= 'id comment-id))))))))
 
 (defun sync-comments ()
-  (dolist (subreddit (with-pg (query (:select '* :from 'subreddit)
-                                     (:dao subreddit))))
-    (when-let ((data (get-reddit (format nil "~acomments.json"
-                                         (subreddit-url subreddit)))))
-      (dolist (comment-bulk (jsown:filter (jsown:parse data)
-                                          "data" "children"))
+  (dolist (link (with-pg (select-dao 'link (:= 'hidden nil))))
+    (dolist (comment (jsown:parse (get-reddit (format nil "~acomments.json"
+                                                      (link-permalink link)))))
+      (dolist (comment-bulk (jsown:filter comment "data" "children"))
         (let ((comment (jsown:val comment-bulk "data")))
-          (destructure-jsown-object ((link-id "link_id")
-                                     id body author)
+          (destructure-jsown-object (id body author)
               comment
-            (when (and (not (link-hidden-p link-id))
+            (when (and (not (link-hidden-p (link-id link)))
                        (not (has-commentp id)))
               (add-or-update-comment comment)
               (handler-case
                   (log:info "~a on ~a ~a ~% ~a ~%"
-                            author (subreddit-display-name subreddit)
-                            link-id body)
+                            author (link-subreddit link)
+                            (link-id link) (subseq body 0 20))
                 (error (condition)
                   (log:info "Encoding error: ~a" condition))))))))))
 
@@ -1668,7 +1608,7 @@ found.
                                  (:dao link)))))
 
 (defroute display-single-link-json ("/link/json/:id") ()
-  (when-let ((link (with-pg (get-dao 'link id))))
+  (let ((link (with-pg (get-dao 'link id))))
     (setf (hunchentoot:content-type*) "application/json")
     (link-bulk link)))
 
@@ -1709,13 +1649,13 @@ found.
   (hunchentoot:redirect "/live"))
 
 (defroute hide-link ("/link/hide/:id") ()
-  (when-let ((link (with-pg (get-dao 'link id))))
+  (let ((link (with-pg (get-dao 'link id))))
     (setf (link-hidden link) t)
     (with-pg (update-dao link)))
   "ok")
 
 (defroute make-favorite ("/link/favorite/:id") ()
-  (when-let ((link (with-pg (get-dao 'link id))))
+  (let ((link (with-pg (get-dao 'link id))))
     (if (link-hidden link)
       (progn
         (setf (link-hidden link) nil)
@@ -1787,8 +1727,7 @@ found.
 
 (defroute show-link-json ("/json/:id") ()
   (setf (hunchentoot:content-type*) "application/json")
-  (when-let ((link (with-pg (get-dao 'link id))))
-    (link-bulk link)))
+  (link-bulk (with-pg (get-dao 'link id))))
 
 (defun render/selftext-html (doc)
   (let ((id (jsown:val doc "id")))
