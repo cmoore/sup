@@ -145,11 +145,8 @@
    (store :initarg :static
            :accessor link-store
           :col-type (or db-null text))
-   (remotefile :initarg :remotefile
-               :accessor link-remote-file
-               :col-type (or db-null text))
-   (ts-index :col-type :tsvector))
-
+   (ts-index :col-type db-null
+             :default nil))
   (:metaclass dao-class)
   (:keys id))
 
@@ -667,7 +664,7 @@ found.
   (dolist (link (with-pg (select-dao 'link (:= 'hidden nil))))
     (send-update-graph link)))
 
-(defmethod update-link-comments ((link link) &key (refresh t) verbose)
+(defmethod update-link-comments ((link link) &key (refresh t))
   (unless (and (< 0 (length (with-pg (query (:limit (:select 'id :from 'comment
                                                       :where (:= 'parent (format nil "t3_~a" (link-id link))))
                                                     1)))))
@@ -708,13 +705,11 @@ found.
                                         :id id
                                         :scores (vector count))))))
 
-(defparameter *media-queue*
-  (lparallel.queue:make-queue :fixed-capacity 10000))
-
+(defparameter *media-mailbox*
+  (sb-concurrency:make-mailbox :name "Media Mailbox"))
 
 (defun add-to-media-queue (url link-id)
-  (lparallel.queue:push-queue (list url link-id)
-                              *media-queue*))
+  (sb-concurrency:send-message *media-mailbox* (list url link-id)))
 
 (defun fetch-media (url)
   (handler-case
@@ -791,7 +786,7 @@ found.
       (log:info "media download failed: ~a" condition))))
 
 (defun media-download-worker ()
-  (handle-media-envelope (lparallel.queue:pop-queue *media-queue*)))
+  (handle-media-envelope (sb-concurrency:receive-message *media-mailbox*)))
 
 (defun start-media-worker ()
   (bt:make-thread (lambda ()
@@ -865,9 +860,7 @@ found.
   (rescan-link (with-pg (get-dao 'link link-id))))
 
 (defmethod rescan-link ((link link))
-  (let ((bulk (and (not (eq :null (link-bulk link)))
-                   (jsown:parse (link-bulk link)))))
-    (find-media (jsown:parse (link-bulk link)) (link-id link))))
+  (find-media (jsown:parse (link-bulk link)) (link-id link)))
 
 (defun rescan-media ()
   (dolist (link-id (with-pg (query (:select 'id :from 'link))))
@@ -915,7 +908,6 @@ found.
         (with-pg (update-dao up-hist)))
       (make-new-like-cache link-obj))))
 
-
 (defun handle-possible-new-link (link-obj)
   (destructure-jsown-object (id title subreddit score permalink selftext author url
                                 (label-flair-text "label_flair_text" :safe)
@@ -929,14 +921,15 @@ found.
                                 (selftext-html "selftext_html"))
       link-obj
     (if-let ((existing-link (with-pg (get-dao 'link id))))
-      (progn (setf (link-bulk existing-link)
-                   (jsown:to-json link-obj))
-             (with-pg (update-dao existing-link))
-             (when (link-hidden existing-link)
-               (return-from handle-possible-new-link))
-             (update-like-cache link-obj)
-             (find-media link-obj id)
-             (send-update-graph existing-link))
+      (progn
+        (with-pg (query (:update 'link :set 'bulk '$1 :where (:= 'id '$2))
+                        (jsown:to-json link-obj)
+                        id))
+        (when (link-hidden existing-link)
+          (return-from handle-possible-new-link))
+        (update-like-cache link-obj)
+        (find-media link-obj id)
+        (send-update-graph existing-link))
       (unless (has-seen-p id)
         (log:info "~a -> ~a" subreddit title)
         (let ((new-link (make-instance
@@ -973,7 +966,6 @@ found.
                                       *interface-queue*)
           (send-update-graph new-link))))))
 
-
 (defun send-hide-link (id)
   (lparallel.queue:push-queue (jsown:to-json `(:obj ("id" . ,id)
                                               ("action" . "remove-link")))
@@ -987,9 +979,8 @@ found.
                                                                              (subreddit-display-name subreddit))
                                                                          (:= 'hidden nil)))
                                    :column)))
-    (let ((link (with-pg (get-dao 'link link-id))))
-      (setf (link-hidden link) t)
-      (with-pg (update-dao link)))
+    (with-pg (query (:update 'link :set 'hidden '$1 :where (:= 'id '$2))
+                    t link-id))
     (send-hide-link link-id)))
 
 (defmethod show-subreddit ((subreddit string))
@@ -1032,32 +1023,54 @@ found.
 (defun stop-refresh-threads ()
   (cl-ivy:stop-thread-by-name "fetchers"))
 
-(defmethod mark-subreddit-as-read ((subreddit subreddit))
+(defmethod mark-subreddit ((subreddit string) (mark-type (eql :read)))
+  (mark-subreddit
+   (car (with-pg (query
+                  (:select '* :from 'subreddit :where (:= 'display_name subreddit))
+                  (:dao subreddit))))
+   :read))
+(defmethod mark-subreddit ((subreddit subreddit) (mark-type (eql :read)))
   (with-slots (display-name) subreddit
     (dolist (link (with-pg (select-dao 'link (:and (:= 'hidden nil)
                                                    (:= 'subreddit display-name)))))
-      (setf (link-hidden link) t)
-      (with-pg (update-dao link)))))
-
-(defmethod mark-subreddit-as-read ((subreddit-name string))
-  (mark-subreddit-as-read (car (with-pg (query
-                                         (:select '* :from 'subreddit :where (:= 'display_name subreddit-name))
-                                         (:dao subreddit))))))
-
-(defmethod mark-subreddit-as-unread ((subreddit subreddit))
+      (mark-link link :read))))
+(defmethod mark-subreddit ((subreddit string) (mark-type (eql :unread)))
+  (mark-subreddit
+   (car (with-pg (query
+                  (:select '* :from 'subreddit :where (:= 'display_name subreddit))
+                  (:dao subreddit))))
+   :unread))
+(defmethod mark-subreddit ((subreddit subreddit) (mark-type (eql :unread)))
   (with-slots (display-name) subreddit
-    (dolist (link (with-pg (select-dao 'link (:and (:= 'subreddit display-name)
-                                                   (:= 'hidden t)))))
-      (setf (link-hidden link) nil)
-      (with-pg (update-dao link)))))
+    (dolist (link (with-pg (select-dao 'link (:and (:= 'hidden nil)
+                                                   (:= 'subreddit display-name)))))
+      (mark-link link :unread))))
 
-(defmethod mark-subreddit-as-unread ((subreddit-name string))
-  (let ((subreddit (car (with-pg (query
-                                  (:select '* :from 'subreddit :where (:= 'display_name subreddit-name))
-                                  (:dao subreddit))))))
-    (mark-subreddit-as-unread subreddit)))
+(defmethod mark-link ((link link) (mark-type (eql :shadow)))
+  (if (link-shadow link)
+      (with-pg (query (:update 'link :set 'shadow '$1 :where (:= 'id '$2))
+                      nil (link-id link)))
+      (with-pg (query (:update 'link :set 'shadow '$1 :where (:= 'id '$2))
+                      t (link-id link)))))
+(defmethod mark-link ((link link) (mark-type (eql :nsfw)))
+  (if (link-nsfw link)
+      (with-pg (query (:update 'link :set 'nsfw '$1 :where (:= 'id '$2))
+                      nil (link-id link)))
+      (with-pg (query (:update 'link :set 'nsfw '$1 :where (:= 'id '$2))
+                      t (link-id link)))))
+(defmethod mark-link ((link link) (mark-type (eql :favorite)))
+  (if (link-favorite link)
+      (with-pg (query (:update 'link :set 'favorite '$1 :where (:= 'id '$2))
+                      nil (link-id link)))
+      (with-pg (query (:update 'link :set 'favorite '$1 :where (:= 'id '$2))
+                      t (link-id link)))))
+(defmethod mark-link ((link link) (mark-type (eql :read)))
+  (with-pg (query (:update 'link :set 'hidden '$1 :where (:= 'id '$2))
+                  t (link-id link))))
+(defmethod mark-link ((link link) (mark-type (eql :unread)))
+  (with-pg (query (:update 'link :set 'hidden '$1 :where (:= 'id '$2))
+                  nil (link-id link))))
 
-(defgeneric display-link (link))
 
 (defmethod display-link ((link-id string))
   (display-link (with-pg (get-dao 'link link-id))))
@@ -1192,8 +1205,6 @@ found.
            (:div.panel-body :class "link-body"
                             :style "padding: 10px 15px 15px;"
                             :id (format nil "link-~a" unique-id))
-
-
            (:div :class "panel-heading"
              (:div
                :class "icon comment-trigger"
@@ -1224,11 +1235,11 @@ found.
 
 (defun mark-everything-unread ()
   (dolist (subreddit (with-pg (select-dao 'subreddit)))
-    (mark-subreddit-as-unread (subreddit-display-name subreddit))))
+    (mark-subreddit (subreddit-display-name subreddit) :unread)))
 
 (defun mark-everything-read ()
   (dolist (subreddit (with-pg (select-dao 'subreddit)))
-    (mark-subreddit-as-read subreddit)))
+    (mark-subreddit subreddit :read)))
 
 (defvar *display-offset* nil)
 
@@ -1441,8 +1452,6 @@ found.
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (pushnew 'find-room hunchensocket:*websocket-dispatch-table*))
 
-(defgeneric mailbox-send (client message &rest args))
-
 (defmethod mailbox-send ((user user) (message string) &rest args)
   (handler-case
       (hunchensocket:send-text-message user (apply #'format nil message args))
@@ -1461,7 +1470,7 @@ found.
 
 (defmethod interface-add-link ((link-id string))
   (lparallel.queue:push-queue (jsown:to-json `(:obj ("action" . "add-link")
-                                             ("id" . ,link-id)))
+                                                    ("id" . ,link-id)))
                               *interface-queue*))
 
 (defun new-articles-to-live ()
@@ -1516,8 +1525,8 @@ found.
    (hunchentoot:start *ws-server*)))
 
 (defun check-image (filepath)
-  (let* ((filename (path:basename filepath))
-         (hash (car (ppcre:split "\\." (file-namestring filename)))))
+  (let* ((filename (file-namestring (path:basename filepath)))
+         (hash (car (ppcre:split "\\." filename))))
     (unless (or (ppcre:scan "git_keep" filename)
                 (with-pg (query (:select 'hash :from 'media :where (:= 'hash hash)))))
       (delete-file filepath)
@@ -1581,8 +1590,7 @@ found.
                                              (:desc 'created_utc))
                                   :column)))
     (let ((the-link (with-pg (get-dao 'link linkid))))
-      (setf (link-hidden the-link) t)
-      (with-pg (update-dao the-link)))))
+      (mark-link the-link :read))))
 
 
 
@@ -1598,7 +1606,7 @@ found.
   (setf (hunchentoot:content-type*) "application/json")
   (if-let ((up-history (with-pg (get-dao 'up-history id))))
     (with-output-to-string (sink)
-      (jsown:to-json (up-history-scores up-history) sink))
+      (jsown:to-json (up-history-scores up-history)))
     "[]"))
 
 (defroute show-author ("/author/:author") ()
@@ -1635,36 +1643,19 @@ found.
 
 (defroute shadow-link ("/shadow/:id") ()
   (when-let ((link (with-pg (get-dao 'link id))))
-    (if (link-shadow link)
-      (progn
-        (setf (link-shadow link) nil)
-        (setf (link-hidden link) nil))
-      (progn
-        (setf (link-shadow link) t)
-        (setf (link-hidden link) t)))
-    (with-pg (update-dao link))
-    (with-html-string (:div "ok"))))
+    (mark-link link :shadow)))
 
 (defroute index ("/") ()
   (hunchentoot:redirect "/live"))
 
 (defroute hide-link ("/link/hide/:id") ()
   (let ((link (with-pg (get-dao 'link id))))
-    (setf (link-hidden link) t)
-    (with-pg (update-dao link)))
+    (mark-link link :read))
   "ok")
 
 (defroute make-favorite ("/link/favorite/:id") ()
   (let ((link (with-pg (get-dao 'link id))))
-    (if (link-hidden link)
-      (progn
-        (setf (link-hidden link) nil)
-        (setf (link-favorite link) nil)
-        (with-pg (update-dao link)))
-      (progn
-        (setf (link-hidden link) t)
-        (setf (link-favorite link) t)
-        (with-pg (update-dao link)))))
+    (mark-link link :favorite))
   "ok")
 
 (defroute reset-media ("/media/reset/:id") ()
@@ -2105,28 +2096,6 @@ found.
    (dolist (link (get-links-by-text pattern))
      (display-link link))))
 
-(defun check-nsfw-setting (uuid-list)
-  (dolist (uuid uuid-list)
-    (when-let* ((link (with-pg (get-dao 'link uuid)))
-                (bulk (link-bulk link))
-                (bulk-json (and (stringp bulk)
-                                (jsown:parse bulk))))
-      (if bulk-json
-          (destructure-jsown-object ((over-18 "over_18" :safe)
-                                     (nsfw "nsfw" :safe))
-              bulk-json
-
-            (when (and over-18 (not nsfw))
-              (setf (link-nsfw link) t)
-              (with-pg (update-dao link))))
-          (log:info "No bulk?  ~a" uuid)))))
-
-(defun update-nsfw-settings ()
-  (cl-ivy:with-lparallel (:workers 8)
-    (lparallel:pmap nil
-                    #'check-nsfw-setting
-                    (cl-ivy:partition 100 (with-pg (query (:select 'id :from 'link) :column))))))
-
 (defun check-file (filename)
   (let ((hash (car (ppcre:split "\\."
                                 (file-namestring
@@ -2223,6 +2192,15 @@ found.
   (start-server)
   (start-ws-server)
   (start-ws-reader-thread)
-  (start-refresh-threads)
+  ;;(start-refresh-threads)
   (dotimes (x 5)
     (start-media-worker)))
+
+;; (defun copy-bulks-to-couchdb ()
+;;   (let ((link-ids (with-pg (query (:select 'id :from 'link)
+;;                                   :column))))
+;;     (with-lparallel (:workers 8)
+;;       (lparallel:pmap nil (lambda (id)
+;;                             (let ((link (with-pg (get-dao 'link id))))
+;;                               (mango:doc-put "testing" (link-bulk link))))
+;;                       link-ids))))

@@ -75,7 +75,7 @@ CREATE TABLE public.link (
     shadow boolean DEFAULT false NOT NULL,
     store text,
     remotefile text,
-    ts_index tsvector NOT NULL
+    ts_index tsvector GENERATED ALWAYS AS (to_tsvector('english'::regconfig, ((((COALESCE(title, ''::text) || ' '::text) || COALESCE(body, ''::text)) || ' '::text) || COALESCE(selftext, ''::text)))) STORED
 );
 
 
@@ -270,13 +270,6 @@ CREATE UNIQUE INDEX subreddit_id_index ON public.subreddit USING btree (id);
 --
 
 CREATE UNIQUE INDEX up_history_id_index ON public.up_history USING btree (id);
-
-
---
--- Name: link tsvectorupdate; Type: TRIGGER; Schema: public; Owner: cmoore
---
-
-CREATE TRIGGER tsvectorupdate BEFORE INSERT OR UPDATE ON public.link FOR EACH ROW EXECUTE FUNCTION tsvector_update_trigger('ts_index', 'pg_catalog.english', 'title');
 
 
 --
