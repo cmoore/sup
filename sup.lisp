@@ -295,7 +295,7 @@
     (block retry-it
       (tagbody retry
          (when (> tries 10)
-           (log:info "RETRIED TOO MUCH!  BAILING!")
+           (log:info "Too many retries!  Bailing on ~a" url)
            (return-from raw-http-request nil))
          (setf tries (+ tries 1))
          (handler-bind ((error #'(lambda (condition)
@@ -315,7 +315,7 @@
                      (200 (values data code))
                      (503 (values nil code))
                      (t (progn
-                          (log:warn "Result code: ~a" code)
+                          (log:warn "Request result code: ~a, returning nil" code)
                           (values nil nil))))))
              (retry ()
                (sleep 1)
@@ -706,10 +706,12 @@ found.
                                         :scores (vector count))))))
 
 (defparameter *media-mailbox*
-  (sb-concurrency:make-mailbox :name "Media Mailbox"))
+  #+sbcl (sb-concurrency:make-mailbox :name "Media Mailbox")
+  #+lispworks (mp:make-mailbox :name "Media Mailbox"))
 
 (defun add-to-media-queue (url link-id)
-  (sb-concurrency:send-message *media-mailbox* (list url link-id)))
+  #+sbcl (sb-concurrency:send-message *media-mailbox* (list url link-id))
+  #+lispworks (mp:mailbox-send *media-mailbox* (list url link-id)))
 
 (defun fetch-media (url)
   (handler-case
@@ -786,7 +788,8 @@ found.
       (log:info "media download failed: ~a" condition))))
 
 (defun media-download-worker ()
-  (handle-media-envelope (sb-concurrency:receive-message *media-mailbox*)))
+  #+sbcl (handle-media-envelope (sb-concurrency:receive-message *media-mailbox*))
+  #+lispworks (handle-media-envelope (mp:mailbox-read *media-mailbox*)))
 
 (defun start-media-worker ()
   (bt:make-thread (lambda ()
@@ -860,10 +863,12 @@ found.
   (rescan-link (with-pg (get-dao 'link link-id))))
 
 (defmethod rescan-link ((link link))
-  (find-media (jsown:parse (link-bulk link)) (link-id link)))
+  (find-media (jsown:parse (link-bulk link))
+              (link-id link)))
 
 (defun rescan-media ()
-  (dolist (link-id (with-pg (query (:select 'id :from 'link))))
+  (dolist (link-id (with-pg (query (:select 'id :from 'link :where (:not-null 'hidden))
+                                   :column)))
     (rescan-link link-id)))
 
 (defroute handle-media ("/media/:id") ()
@@ -932,8 +937,7 @@ found.
         (send-update-graph existing-link))
       (unless (has-seen-p id)
         (log:info "~a -> ~a" subreddit title)
-        (let ((new-link (make-instance
-                         'link
+        (let ((new-link (make-instance 'link
                          :id id
                          :hidden nil
                          :written (get-universal-time)
@@ -1029,17 +1033,20 @@ found.
                   (:select '* :from 'subreddit :where (:= 'display_name subreddit))
                   (:dao subreddit))))
    :read))
+
 (defmethod mark-subreddit ((subreddit subreddit) (mark-type (eql :read)))
   (with-slots (display-name) subreddit
     (dolist (link (with-pg (select-dao 'link (:and (:= 'hidden nil)
                                                    (:= 'subreddit display-name)))))
       (mark-link link :read))))
+
 (defmethod mark-subreddit ((subreddit string) (mark-type (eql :unread)))
   (mark-subreddit
    (car (with-pg (query
                   (:select '* :from 'subreddit :where (:= 'display_name subreddit))
                   (:dao subreddit))))
    :unread))
+
 (defmethod mark-subreddit ((subreddit subreddit) (mark-type (eql :unread)))
   (with-slots (display-name) subreddit
     (dolist (link (with-pg (select-dao 'link (:and (:= 'hidden nil)
@@ -1052,21 +1059,25 @@ found.
                       nil (link-id link)))
       (with-pg (query (:update 'link :set 'shadow '$1 :where (:= 'id '$2))
                       t (link-id link)))))
+
 (defmethod mark-link ((link link) (mark-type (eql :nsfw)))
   (if (link-nsfw link)
       (with-pg (query (:update 'link :set 'nsfw '$1 :where (:= 'id '$2))
                       nil (link-id link)))
       (with-pg (query (:update 'link :set 'nsfw '$1 :where (:= 'id '$2))
                       t (link-id link)))))
+
 (defmethod mark-link ((link link) (mark-type (eql :favorite)))
   (if (link-favorite link)
       (with-pg (query (:update 'link :set 'favorite '$1 :where (:= 'id '$2))
                       nil (link-id link)))
       (with-pg (query (:update 'link :set 'favorite '$1 :where (:= 'id '$2))
                       t (link-id link)))))
+
 (defmethod mark-link ((link link) (mark-type (eql :read)))
   (with-pg (query (:update 'link :set 'hidden '$1 :where (:= 'id '$2))
                   t (link-id link))))
+
 (defmethod mark-link ((link link) (mark-type (eql :unread)))
   (with-pg (query (:update 'link :set 'hidden '$1 :where (:= 'id '$2))
                   nil (link-id link))))
@@ -1479,9 +1490,10 @@ found.
                                  (:asc 'created_utc))
 
                                 (:dao link))))
-    (lparallel.queue:push-queue (jsown:to-json `(:obj ("action" . "add-link")
-                                                      ("id" . ,(link-id link))))
-                                *interface-queue*)))
+    (lparallel.queue:push-queue
+     (jsown:to-json `(:obj ("action" . "add-link")
+                           ("id" . ,(link-id link))))
+     *interface-queue*)))
 
 (defmethod hunchensocket:client-connected ((room chat-room) user)
   (declare (ignore user))
@@ -1655,7 +1667,8 @@ found.
 
 (defroute make-favorite ("/link/favorite/:id") ()
   (let ((link (with-pg (get-dao 'link id))))
-    (mark-link link :favorite))
+    (mark-link link :favorite)
+    (mark-link link :read))
   "ok")
 
 (defroute reset-media ("/media/reset/:id") ()
@@ -2114,32 +2127,32 @@ found.
     (with-lparallel (:workers 4)
       (lparallel:pmapcar #'check-media (with-pg (query (:select 'id :from 'media)))))))
 
-;; #+lispworks
-;; (capi:define-interface wutface-interface () ()
-;;   (:panes
-;;    (browser capi:browser-pane
-;;             :min-height 600
-;;             :min-width 800
-;;             :url "http://localhost:9000"))
-;;   (:layouts
-;;    (main-layout capi:column-layout
-;;                 '(row-with-editor-pane))
-;;    (row-with-editor-pane capi:row-layout '(browser)))
-;;   ;; (:menus
-;;   ;;  (file-menu "File" (("Open"))
-;;   ;;             :selection-callback 'file-choice)
-;;   ;;  (page-menu "Page"
-;;   ;;             (("Page Up" :selection-callback 'scroll-up)
-;;   ;;              ("Page Down" :selection-callback 'scroll-down))))
-;;   ;; (:menu-bar file-menu page-menu)
-;;   )
+#+lispworks
+(capi:define-interface wutface-interface () ()
+  (:panes
+   (browser capi:browser-pane
+            :min-height 600
+            :min-width 800
+            :url "http://localhost:9000"))
+  (:layouts
+   (main-layout capi:column-layout
+                '(row-with-editor-pane))
+   (row-with-editor-pane capi:row-layout '(browser)))
+  ;; (:menus
+  ;;  (file-menu "File" (("Open"))
+  ;;             :selection-callback 'file-choice)
+  ;;  (page-menu "Page"
+  ;;             (("Page Up" :selection-callback 'scroll-up)
+  ;;              ("Page Down" :selection-callback 'scroll-down))))
+  ;; (:menu-bar file-menu page-menu)
+  )
 
-;; #+lispworks
-;; (defun interface-main ()
-;;   (start)
-;;   (capi:display (make-instance 'wutface-interface))
-;;   (capi:contain (make-instance 'capi:listener-pane
-;;                                :title "Listener")))
+#+lispworks
+(defun interface-main ()
+  (start)
+  (capi:display (make-instance 'wutface-interface))
+  (capi:contain (make-instance 'capi:listener-pane
+                               :title "Listener")))
 
 
 
@@ -2192,7 +2205,7 @@ found.
   (start-server)
   (start-ws-server)
   (start-ws-reader-thread)
-  ;;(start-refresh-threads)
+  (start-refresh-threads)
   (dotimes (x 5)
     (start-media-worker)))
 
