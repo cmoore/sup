@@ -12,7 +12,7 @@
         #:postmodern)
   (:import-from :alexandria #:when-let #:when-let*
                 #:if-let #:read-file-into-string
-                #:switch #:flatten
+                #:switch #:flatten #:with-gensyms
                 #:alist-hash-table)
   (:import-from :parenscript #:defpsmacro)
   (:export #:interface-main
@@ -254,7 +254,10 @@
         :accessor media-url)
    (hash :col-type :text
          :initarg :hash
-         :accessor media-hash))
+         :accessor media-hash)
+   (content-hash :col-type (or db-null :text)
+                 :initarg :content-hash
+                 :accessor media-content-hash))
   (:metaclass dao-class)
   (:keys id))
 
@@ -272,59 +275,70 @@
   (with-pg (get-dao 'seen id)))
 
 
-(defgeneric make-author-link (object))
+(defgeneric make-author-link (object)
+  (:method ((link link))
+    (with-slots (author) link
+      (with-html
+        (:div.icon
+         (:a :target (format nil "~aauthorlink" author)
+           :href (format nil "/author/~a" author)
+           (:i :class "s7-user-female"))))))
+  (:method ((comment comment))
+    (with-slots (author) comment
+      (with-html
+        (:div.icon
+         (:a :target (format nil "~aauthorcomments" author)
+           :href (format nil "/comments/author/~a" author)
+           (:i :class "s7-note")))))))
 
-(defmethod make-author-link ((link link))
-  (with-slots (author) link
-    (with-html
-      (:div.icon
-       (:a :target (format nil "~aauthorlink" author)
-         :href (format nil "/author/~a" author)
-         (:i :class "s7-user-female"))))))
-
-(defmethod make-author-link ((comment comment))
-  (with-slots (author) comment
-    (with-html
-      (:div.icon
-       (:a :target (format nil "~aauthorcomments" author)
-         :href (format nil "/comments/author/~a" author)
-         (:i :class "s7-note"))))))
-
-(defun raw-http-request (url)
-  (let ((tries 0))
-    (block retry-it
-      (tagbody retry
-         (when (> tries 10)
-           (log:info "Too many retries!  Bailing on ~a" url)
-           (return-from raw-http-request nil))
-         (setf tries (+ tries 1))
-         (handler-bind ((error #'(lambda (condition)
-                                   (declare (ignore condition))
-                                   (invoke-restart (find-restart 'retry)))))
-           (restart-case
-               (return-from retry-it
-                 (multiple-value-bind (data code)
-                     (drakma:http-request url
-                                          :additional-headers
-                                          '(("User-Agent" . "supyawl:0.2 (by /u/clintm")
-                                            ("X-BULL" . "Ferdinand")
-                                            ("X-BULL-FIGHTS" . "No, he's a peaceful bull."))
-                                          :external-format-in :utf-8
-                                          :external-format-out :utf-8)
-                   (switch (code)
-                     (200 (values data code))
-                     (503 (values nil code))
-                     (t (progn
-                          (log:warn "Request result code: ~a, returning nil" code)
-                          (values nil nil))))))
-             (retry ()
-               (sleep 1)
-               (log:warn "Retrying: ~a" url)
-               (go retry))))))))
+(defmacro with-retry ((&key (retries 10)
+                         (name "with-retry"))
+                      &body retryable-block)
+  (with-gensyms (tries)
+    `(let ((,tries 0))
+       (block retry-block
+         (tagbody retry
+            (when (> ,tries ,retries)
+              (log:info "Too many retries! Bailing on ~a" ,name)
+              (return-from retry-block nil))
+            (setf ,tries (+ ,tries 1))
+            (handler-bind ((error #'(lambda (condition)
+                                      (log:info "with-retry: failed on: ~a" condition)
+                                      (invoke-restart (find-restart 'retry)))))
+              (restart-case
+                  (return-from retry-block
+                    (progn ,@retryable-block))
+                (retry ()
+                  (sleep 1)
+                  (log:warn "Retrying: ~a retry: ~a " ,name ,tries)
+                  (go retry)))))))))
 
 (defun get-reddit (path)
-  (log:debug path)
-  (raw-http-request (format nil "https://reddit.com~a" path)))
+  ;;(log:debug "loading: ~a" path)
+  (let ((path (format nil "https://oauth.reddit.com~a" path)))
+    (with-retry (:name "get-reddit")
+      (let (triggered-authenticate)
+        (multiple-value-bind (data code)
+            (drakma:http-request path
+                                 :additional-headers
+                                 `(("User-Agent" . "supyawl:0.2 (by /u/clintm")
+                                   ;; ("X-BULL" . "Ferdinand")
+                                   ;; ("X-BULL-FIGHTS" . "No, he's a peaceful bull.")
+                                   ("Authorization" . ,(format nil "bearer ~a" *reddit-access-token*)))
+                                 :external-format-in :utf-8
+                                 :external-format-out :utf-8)
+          (switch (code)
+            (200 (values data code))
+            (503 (values nil code))
+            (401 (if triggered-authenticate
+                     nil
+                     (progn
+                       (authenticate)
+                       (setf triggered-authenticate t)
+                       nil)))
+            (t (progn
+                 (log:warn "Request result code: ~a, returning nil" code)
+                 (values nil nil)))))))))
 
 (defmacro destructure-jsown-object (bind-list object &body body)
   "Ala DESTRUCTURING-BIND, decompose a JSOWN object.
@@ -361,7 +375,6 @@ found.
                    bind-list))
      ,@body))
 
-
 (defmacro distill-jsown-object-list (list-of-jsown-objects &rest path)
   "Given a list of JSOWN objects, provide a path for JSOWN:FILTER down each to get a value."
   (let ((current (gensym))
@@ -382,7 +395,9 @@ found.
                                  :additional-headers (list (cons "User-Agent" "supyawl:0.2 (by /u/clintm"))
                                  :accept "application/json"
                                  :content-type "application/json"
-                                 :parameters (list (cons "grant_type" "password")
+                                 :parameters (list (cons "scope" "creddits modnote modcontributors modmail modconfig subscribe structuredstyles vote wikiedit mysubreddits submit modlog modposts modflair save modothers read privatemessages report identity livemanage account modtraffic wikiread edit modwiki modself history flair")
+                                                   (cons "grant_type" "password")
+                                                   (cons "duration" "permanent")
                                                    (cons "username" reddit-login)
                                                    (cons "password" reddit-password))
                                  :method :post
@@ -512,21 +527,26 @@ found.
                 (-> $ (ajax (ps:create :type "get"
                                        :url (concatenate 'string "/graph/history/" link-id)
                                        :success (lambda (obj)
-                                                  (-> (sel (concatenate 'string "#graph" link-id))
-                                                      (sparkline obj
-                                                                 (ps:create :width "100%"
-                                                                            :height "35"
-                                                                            :line-width 1.7))))))))))))
+                                                  (let* ((scores (ps:@ obj scores))
+                                                         (color (ps:@ obj color)))
+                                                    (-> (sel (concatenate 'string "#graph" link-id))
+                                                        (sparkline scores
+                                                                   (ps:create width "100%"
+                                                                              height "35"
+                                                                              line-color color
+                                                                              fill-color (if (string= color "red")
+                                                                                             "pink"
+                                                                                             "#cdf")
+                                                                              line-width 1.7)))))))))))))
        (:script
          (:raw
           (ps:ps
             (with-document-ready
                 (lambda ()
                   (-> -app (init))
-                  (-> window (add-event-listener
-                              "load"
-                              (lambda ()
-                                (-> -app (page-gallery)))))
+                  (-> window (add-event-listener "load"
+                                                 (lambda ()
+                                                   (-> -app (page-gallery)))))
                   (-> window (add-event-listener
                               "DOMContentLoaded"
                               (lambda ()
@@ -538,7 +558,7 @@ found.
                                   :additional-headers
                                   `(("User-Agent" . "supyawl:0.2 (by /u/clintm")
                                     ("Authorization" . ,(format nil "bearer ~a" *reddit-access-token*))))))
-    (authenticate)
+    ;;(authenticate)
     (when-let ((post-data (handler-case (jsown:val (jsown:parse
                                                     (reddit-request "/subreddits/mine"))
                                                    "data")
@@ -552,7 +572,7 @@ found.
     (let* ((reddit-names (distill-jsown-object-list reddit-subreddits "data" "display_name"))
            (db-subreddits (with-pg (select-dao 'subreddit)))
            (db-names (mapcar #'subreddit-display-name db-subreddits))
-           (needs-cleanup nil))
+           needs-cleanup)
 
       ;; Confirm that all subscribed subreddits are in the database.
       (dolist (reddit-name reddit-names)
@@ -603,38 +623,36 @@ found.
     (format nil "~a~@[~a~].json?limit=100~@[&after=~a~]"
             (subreddit-url subreddit) type after)))
 
-(defgeneric sync-subreddit (subreddit &key reset &allow-other-keys))
-
-(defmethod sync-subreddit ((subreddit subreddit) &key reset)
-  "Fetch the entire history of this subreddit."
-  (labels ((handle-this-block (jsown-block)
-             (dolist (link (jsown:filter jsown-block "data" "children"))
-               (destructure-jsown-object (data kind)
-                   link
-                 (when (string= kind "t3")
-                   (when reset
-                     (with-pg
-                       (when-let ((seen-record (get-dao 'seen (jsown:val data "id"))))
-                         (delete-dao seen-record))))
-                   (handle-possible-new-link data)))))
-           (get-next-page (after-id type)
-             (let ((new-url (make-request-url subreddit :type type :after after-id)))
-               (when-let ((link (ignore-errors (jsown:parse (get-reddit new-url)))))
-                 (handle-this-block link)
-                 (when-let ((next-page (jsown:filter link "data" "after")))
-                   (get-next-page next-page type))))))
-    (dolist (type '(nil :top :controversial :new))
-      (let ((parsed (jsown:parse (get-reddit (make-request-url subreddit :type type)))))
-        (handle-this-block parsed)
-        (get-next-page (jsown:filter parsed "data" "after")
-                       type)))))
-
-(defmethod sync-subreddit ((subreddit-name string) &key reset)
-  (let ((subreddit (car (with-pg (query (:select '* :from 'subreddit
-                                          :where (:= 'display_name subreddit-name))
-                                        (:dao subreddit))))))
-    (sync-subreddit subreddit :reset reset)))
-
+(defgeneric sync-subreddit (subreddit &key reset &allow-other-keys)
+  (:method ((subreddit subreddit) &key reset)
+    (labels ((handle-this-block (jsown-block)
+               (dolist (link (jsown:filter jsown-block "data" "children"))
+                 (destructure-jsown-object (data kind)
+                     link
+                   (when (string= kind "t3")
+                     (when reset
+                       (with-pg
+                         (when-let ((seen-record (get-dao 'seen (jsown:val data "id"))))
+                           (delete-dao seen-record))))
+                     (handle-possible-new-link data)))))
+             (get-next-page (after-id type)
+               (let ((new-url (make-request-url subreddit :type type :after after-id)))
+                 (when-let ((link (ignore-errors (jsown:parse (get-reddit new-url)))))
+                   (handle-this-block link)
+                   (when-let ((next-page (jsown:filter link "data" "after")))
+                     (get-next-page next-page type))))))
+      (dolist (type '(nil :top :controversial :new))
+        (if-let ((reddit-data (get-reddit (make-request-url subreddit :type type))))
+          (let ((parsed (jsown:parse reddit-data)))
+            (handle-this-block parsed)
+            (get-next-page (jsown:filter parsed "data" "after")
+                           type))
+          (log:info "Couldn't fetch for ~a" (subreddit-display-name subreddit))))))
+  (:method ((subreddit-name string) &key reset)
+    (let ((subreddit (car (with-pg (query (:select '* :from 'subreddit
+                                            :where (:= 'display_name subreddit-name))
+                                          (:dao subreddit))))))
+      (sync-subreddit subreddit :reset reset))))
 
 (defmethod get-subreddit-links ((subreddit subreddit) &key type)
   (labels ((safe-parse (blob)
@@ -644,8 +662,7 @@ found.
                  (log:info "END OF FILE?? WTF: ~a" condition)
                  nil))))
     (multiple-value-bind (data code)
-        (let ((path (make-request-url subreddit :type type)))
-          (get-reddit path))
+        (get-reddit (make-request-url subreddit :type type))
       (switch (code)
         (200 (if-let ((json-data (safe-parse data)))
                (jsown:filter json-data "data" "children")
@@ -671,7 +688,8 @@ found.
                (not refresh))
     (multiple-value-bind (data code)
         (handler-case
-            (get-reddit (format nil "~acomments.json" (link-permalink link)))
+            (sb-ext:with-timeout 10
+              (get-reddit (format nil "~acomments.json" (link-permalink link))))
           (flexi-streams:external-format-encoding-error (condition)
             (log:info "ENCODING ERROR: ~a" condition)
             (values 201 "NOTHING")))
@@ -714,19 +732,27 @@ found.
   #+lispworks (mp:mailbox-send *media-mailbox* (list url link-id)))
 
 (defun fetch-media (url)
-  (handler-case
-      (multiple-value-bind (data status)
-          (drakma:http-request url)
-        (cond ((= status 200) data)
-              (t nil)))
-    (usocket:unknown-error (condition)
-      (declare (ignore condition))
-      nil)
-    (usocket:timeout-error (condition)
-      (log:warn "fetch-media: timeout: ~a" condition))))
+  (with-retry (:retries 5 :name "fetch-media")
+    (handler-case
+        (multiple-value-bind (data status)
+            (drakma:http-request url)
+          (cond ((= status 200) data)
+                (t nil)))
+      (usocket:unknown-error (condition)
+        (declare (ignore condition))
+        nil)
+      (usocket:timeout-error (condition)
+        (log:warn "fetch-media: timeout: ~a" condition)))))
 
+(defun new-media-path (media)
+  (with-slots (content-hash url)
+      media
+    (asdf:system-relative-pathname "sup"
+                                   (format nil "images/~a.~a"
+                                           content-hash
+                                           (get-image-url-suffix url)))))
 (defun media-path (media)
-  (with-slots (url)
+  (with-slots (url hash)
       media
     (asdf:system-relative-pathname "sup"
                                    (format nil "images/~a.~a"
@@ -736,7 +762,8 @@ found.
 (defun media-exists-p (media)
   (probe-file (media-path media)))
 
-;; TODO: Why are these here?  I can't remember.
+ ;; TODO: Why are these here?  I can't remember.
+
 (defmethod write-to-file ((media media) (data vector))
   nil)
 
@@ -749,7 +776,8 @@ found.
       (progn
         (unless (probe-file (media-path media))
           (alexandria:write-byte-vector-into-file image-data (media-path media))
-          (log:debug "Wrote ~a" (media-path media))))
+          ;;(log:info "Wrote ~a" (media-path media))
+          ))
     (error (condition)
       (log:info "Error writing media for ~a: ~a"
                 (media-link-id media) condition))))
@@ -763,32 +791,34 @@ found.
   (media-for-link (with-pg (get-dao 'link link-id))))
 
 (defun handle-media-envelope (envelope)
-  (handler-case
-      (destructuring-bind (url linkid)
-          envelope
-        (if-let ((media (car (with-pg (select-dao 'media (:= 'hash (cl-ivy:make-hash url)))))))
-          (unless (media-exists-p media)
-            (when-let ((data (fetch-media url)))
-              (write-to-file media data)))
-          (when-let ((image (fetch-media (or (ignore-errors (html-entities:decode-entities url))
-                                             url))))
-            (let ((media (make-instance 'media
-                                        :url url
-                                        :link-id linkid
-                                        :hash (cl-ivy:make-hash url))))
-              (handler-case
-                  (progn
-                    (with-pg (insert-dao media))
-                    (unless (media-exists-p media)
-                      (write-to-file media image)))
-                (cl-postgres-error:unique-violation (condition)
-                  (declare (ignore condition))
-                  nil))))))
-    (error (condition)
-      (log:info "media download failed: ~a" condition))))
+  (when envelope
+    (handler-case
+        (destructuring-bind (url linkid)
+            envelope
+          (if-let ((media (car (with-pg (select-dao 'media (:= 'hash (cl-ivy:make-hash url)))))))
+            (unless (media-exists-p media)
+              (when-let ((data (fetch-media url)))
+                (write-to-file media data)
+                (log:info "Re-wrote for ~a???" linkid)))
+            (when-let ((image (fetch-media (or (ignore-errors (html-entities:decode-entities url))
+                                               url))))
+              (let ((media (make-instance 'media
+                                          :url url
+                                          :link-id linkid
+                                          :hash (cl-ivy:make-hash url))))
+                (handler-case
+                    (progn
+                      (with-pg (insert-dao media))
+                      (unless (media-exists-p media)
+                        (write-to-file media image)))
+                  (cl-postgres-error:unique-violation (condition)
+                    (declare (ignore condition))
+                    nil))))))
+      (error (condition)
+        (log:info "media download failed: ~a" condition)))))
 
 (defun media-download-worker ()
-  #+sbcl (handle-media-envelope (sb-concurrency:receive-message *media-mailbox*))
+  #+sbcl (handle-media-envelope (sb-concurrency:receive-message *media-mailbox* :timeout 30))
   #+lispworks (handle-media-envelope (mp:mailbox-read *media-mailbox*)))
 
 (defun start-media-worker ()
@@ -817,7 +847,6 @@ found.
 
     (when media-metadata
       (dolist (key (jsown:keywords media-metadata))
-        ;;(log:info key)
         (let ((thingy (jsown:val media-metadata key)))
           (when-let ((fsu (ignore-errors (jsown:filter thingy "s" "u"))))
             (add-to-media-queue fsu link-id)))))
@@ -852,6 +881,11 @@ found.
     (unless (eq json-string :null)
       (find-media (jsown:parse (link-bulk link)) id))))
 
+(defun scan-media-for-subreddit (subreddit-name)
+  (dolist (link-id (with-pg (query (:select 'id :from 'link :where (:= 'subreddit subreddit-name))
+                                   :column)))
+    (scan-media-for-id link-id)))
+
 (defun load-em-up ()
   (with-lparallel (:workers 4)
     (lparallel:pmapcar #'scan-media-for-id
@@ -870,6 +904,36 @@ found.
   (dolist (link-id (with-pg (query (:select 'id :from 'link :where (:not-null 'hidden))
                                    :column)))
     (rescan-link link-id)))
+
+;; (defun fix-duplicates ()
+;;   (let ((unique-hashes (with-pg (query (:select (:distinct 'content-hash)
+;;                                          :from 'media)))))
+;;     (dolist (hash unique-hashes)
+;;       (let ((duplicates (with-pg (query (:select '* :from media
+;;                                           :where (:= 'content-hash hash))
+;;                                         (:dao media)))))
+;;         (when (< 0 (length duplicates))
+;;           (let ((start (car duplicates))
+;;                 (rest (cdr duplicates)))
+;;             (dolist (to-update rest)
+;;               (setf (link-hash )))))))))
+
+(defun fill-in-content-hashes ()
+  (loop
+    (if-let ((media-list (with-pg (query (:limit (:select '* :from 'media
+                                                   :where (:is-null 'content-hash))
+                                                 100)
+                                         (:dao media)))))
+      (map 'null (lambda (media)
+                   (let ((path (media-path media))
+                         (new-path (new-media-path media)))
+                     (when (probe-file path)
+                       (let ((image-data (alexandria:read-file-into-byte-vector path)))
+                         (setf (media-content-hash media)
+                               (cl-ivy:make-hash image-data))
+                         (with-pg (update-dao media))))))
+           media-list)
+      (return-from fill-in-content-hashes))))
 
 (defroute handle-media ("/media/:id") ()
   (let* ((media (with-pg (get-dao 'media id)))
@@ -897,7 +961,7 @@ found.
                           ;; You can create it with a list,
                           ;; but it will come back as a
                           ;; simple-vector
-                          :scores (vector score))))))
+                          :scores (vector score score))))))
 
 (defun update-like-cache (link-obj)
   (destructure-jsown-object (id score)
@@ -938,29 +1002,32 @@ found.
       (unless (has-seen-p id)
         (log:info "~a -> ~a" subreddit title)
         (let ((new-link (make-instance 'link
-                         :id id
-                         :hidden nil
-                         :written (get-universal-time)
-                         :created-utc created-utc
-                         :url url
-                         :permalink permalink
-                         :author author
-                         :subreddit-id subreddit-id
-                         :media-only media-only
-                         :score score
-                         :title title
-                         :nsfw over-18
-                         :author-fullname author-fullname
-                         :selftext selftext
-                         :subreddit subreddit
-                         :bulk (jsown:to-json link-obj)
-                         :body selftext-html
-                         :label-text label-flair-text
+                                       :id id
+                                       :hidden nil
+                                       :written (get-universal-time)
+                                       :created-utc created-utc
+                                       :url url
+                                       :permalink permalink
+                                       :author author
+                                       :subreddit-id subreddit-id
+                                       :media-only media-only
+                                       :score score
+                                       :title title
+                                       :nsfw over-18
+                                       :author-fullname author-fullname
+                                       :selftext selftext
+                                       :subreddit subreddit
+                                       :bulk (jsown:to-json link-obj)
+                                       :body selftext-html
+                                       :label-text label-flair-text
 
-                         :label-background-color (or link-flair-background-color
-                                                     "yellow")
-                         :label-color (or link-flair-text-color
-                                          "black"))))
+                                       :label-background-color (or link-flair-background-color
+                                                                   "yellow")
+                                       :label-color (or link-flair-text-color
+                                                        "black"))))
+          ;; #+:os-macosx
+          ;; (send-notification (format nil "~a - ~a" subreddit title))
+
           (add-seen id)
           (with-pg (insert-dao new-link))
           (find-media link-obj (link-id new-link))
@@ -972,20 +1039,29 @@ found.
 
 (defun send-hide-link (id)
   (lparallel.queue:push-queue (jsown:to-json `(:obj ("id" . ,id)
-                                              ("action" . "remove-link")))
+                                                    ("action" . "remove-link")))
                               *interface-queue*))
 
-(defmethod hide-subreddit ((subreddit string))
-  (hide-subreddit (car (with-pg (select-dao 'subreddit (:= :display_name subreddit))))))
-
-(defmethod hide-subreddit ((subreddit subreddit))
-  (dolist (link-id (with-pg (query (:select 'id :from 'link :where (:and (:= 'subreddit
-                                                                             (subreddit-display-name subreddit))
-                                                                         (:= 'hidden nil)))
-                                   :column)))
-    (with-pg (query (:update 'link :set 'hidden '$1 :where (:= 'id '$2))
-                    t link-id))
-    (send-hide-link link-id)))
+(defgeneric hide-subreddit (subreddit &optional all)
+  (:method ((subreddit string) &optional all)
+    (hide-subreddit (car (with-pg (select-dao 'subreddit (:= :display_name subreddit)))) all))
+  (:method ((subreddit subreddit) &optional all)
+    (let ((links (if all
+                     (with-pg (query (:select 'id
+                                       :from 'link
+                                       :where (:and (:= 'subreddit
+                                                        (subreddit-display-name subreddit))))
+                                     :column))
+                     (with-pg (query (:select 'id
+                                       :from 'link
+                                       :where (:and (:= 'subreddit
+                                                        (subreddit-display-name subreddit))
+                                                    (:= 'hidden nil)))
+                                     :column)))))
+      (dolist (link-id links)
+        (with-pg (query (:update 'link :set 'hidden '$1 :where (:= 'id '$2))
+                        t link-id))
+        (send-hide-link link-id)))))
 
 (defmethod show-subreddit ((subreddit string))
   (show-subreddit (car (with-pg (select-dao 'subreddit (:= :display_name subreddit))))))
@@ -1011,6 +1087,7 @@ found.
 
 (defun scan-subreddits ()
   (dolist (subreddit (with-pg (select-dao 'subreddit)))
+    ;;(log:info "Updating ~a" (subreddit-display-name subreddit))
     (update-subreddit subreddit)
     (sleep 1)))
 
@@ -1027,61 +1104,56 @@ found.
 (defun stop-refresh-threads ()
   (cl-ivy:stop-thread-by-name "fetchers"))
 
-(defmethod mark-subreddit ((subreddit string) (mark-type (eql :read)))
-  (mark-subreddit
-   (car (with-pg (query
-                  (:select '* :from 'subreddit :where (:= 'display_name subreddit))
-                  (:dao subreddit))))
-   :read))
+(defgeneric mark-subreddit (subreddit mark-type)
+  (:method ((subreddit string) (mark-type (eql :read)))
+    (mark-subreddit
+     (car (with-pg (query
+                    (:select '* :from 'subreddit :where (:= 'display_name subreddit))
+                    (:dao subreddit))))
+     :read))
+  (:method ((subreddit subreddit) (mark-type (eql :read)))
+    (with-slots (display-name) subreddit
+      (dolist (link (with-pg (select-dao 'link (:and (:= 'hidden nil)
+                                                     (:= 'subreddit display-name)))))
+        (mark-link link :read)
+        (hide-link (link-id link)))))
+  (:method ((subreddit string) (mark-type (eql :unread)))
+    (mark-subreddit
+     (car (with-pg (query
+                    (:select '* :from 'subreddit :where (:= 'display_name subreddit))
+                    (:dao subreddit))))
+     :unread))
+  (:method ((subreddit subreddit) (mark-type (eql :unread)))
+    (with-slots (display-name) subreddit
+      (dolist (link (with-pg (select-dao 'link (:and (:= 'hidden nil)
+                                                     (:= 'subreddit display-name)))))
+        (mark-link link :unread)))))
 
-(defmethod mark-subreddit ((subreddit subreddit) (mark-type (eql :read)))
-  (with-slots (display-name) subreddit
-    (dolist (link (with-pg (select-dao 'link (:and (:= 'hidden nil)
-                                                   (:= 'subreddit display-name)))))
-      (mark-link link :read))))
-
-(defmethod mark-subreddit ((subreddit string) (mark-type (eql :unread)))
-  (mark-subreddit
-   (car (with-pg (query
-                  (:select '* :from 'subreddit :where (:= 'display_name subreddit))
-                  (:dao subreddit))))
-   :unread))
-
-(defmethod mark-subreddit ((subreddit subreddit) (mark-type (eql :unread)))
-  (with-slots (display-name) subreddit
-    (dolist (link (with-pg (select-dao 'link (:and (:= 'hidden nil)
-                                                   (:= 'subreddit display-name)))))
-      (mark-link link :unread))))
-
-(defmethod mark-link ((link link) (mark-type (eql :shadow)))
-  (if (link-shadow link)
+(defgeneric mark-link (link mark-type)
+  (:method ((link link) (mark-type (eql :shadow)))
+    (if (link-shadow link)
       (with-pg (query (:update 'link :set 'shadow '$1 :where (:= 'id '$2))
                       nil (link-id link)))
       (with-pg (query (:update 'link :set 'shadow '$1 :where (:= 'id '$2))
                       t (link-id link)))))
-
-(defmethod mark-link ((link link) (mark-type (eql :nsfw)))
-  (if (link-nsfw link)
+  (:method ((link link) (mark-type (eql :nsfw)))
+    (if (link-nsfw link)
       (with-pg (query (:update 'link :set 'nsfw '$1 :where (:= 'id '$2))
                       nil (link-id link)))
       (with-pg (query (:update 'link :set 'nsfw '$1 :where (:= 'id '$2))
                       t (link-id link)))))
-
-(defmethod mark-link ((link link) (mark-type (eql :favorite)))
-  (if (link-favorite link)
+  (:method ((link link) (mark-type (eql :favorite)))
+    (if (link-favorite link)
       (with-pg (query (:update 'link :set 'favorite '$1 :where (:= 'id '$2))
                       nil (link-id link)))
       (with-pg (query (:update 'link :set 'favorite '$1 :where (:= 'id '$2))
                       t (link-id link)))))
-
-(defmethod mark-link ((link link) (mark-type (eql :read)))
-  (with-pg (query (:update 'link :set 'hidden '$1 :where (:= 'id '$2))
-                  t (link-id link))))
-
-(defmethod mark-link ((link link) (mark-type (eql :unread)))
-  (with-pg (query (:update 'link :set 'hidden '$1 :where (:= 'id '$2))
-                  nil (link-id link))))
-
+  (:method ((link link) (mark-type (eql :read)))
+    (with-pg (query (:update 'link :set 'hidden '$1 :where (:= 'id '$2))
+                    t (link-id link))))
+  (:method ((link link) (mark-type (eql :unread)))
+    (with-pg (query (:update 'link :set 'hidden '$1 :where (:= 'id '$2))
+                    nil (link-id link)))))
 
 (defmethod display-link ((link-id string))
   (display-link (with-pg (get-dao 'link link-id))))
@@ -1105,103 +1177,103 @@ found.
     (with-html
       (let ((unique-id (format nil "~a" (link-id link)))
             (doc-obj (and (not (eq :NULL bulk))
-                           (jsown:parse bulk))))
+                          (jsown:parse bulk))))
         (:div :class "col-md-4 post" :id (format nil "wx~a" (link-id link))
           (:div.panel.panel-default.panel-borders.panel-heading-fullwidth
            :style "border:1px solid rgb(7,7,7);"
-           (:div :class "panel-heading"
-             :style "font-size:11px;padding: 15px 15px 10px;"
-             (:div :class "tools"
-               (:div :class "icon"
-                 (:a :id (format nil "hider-~a" unique-id)
-                   (:i :class "s7-look")))
-               (:script
-                 (:raw
-                  (ps:ps*
-                   `(-> (sel ,(format nil "#hider-~a" unique-id))
-                        (click (lambda (e)
-                                 (-> (sel ,(format nil "#link-~a" unique-id))
-                                     (toggle))
-                                 (-> e (prevent-default))))))))
-               (make-author-link link)
-               (:a :style "font-weight:bold;"
-                 :target (format nil "win-~a" unique-id)
-                 :href (format nil "/link/~a" id)
-                 (:div.icon (:span.s7-id)))
-               (:a :style "font-weight:bold;"
-                 :target (format nil "json-~a" unique-id)
-                 :href (format nil "/json/~a" id)
-                 (:div :class "icon" (:i :class "s7-safe")))
-               (:a :id (format nil "shadow-~a" unique-id)
-                 (:div :class "icon" (:i :class "s7-trash")))
-               (:script
-                 (:raw
-                  (ps:ps*
-                   `(-> (sel ,(format nil "#shadow-~a" unique-id))
-                        (click (lambda (e)
-                                 (-> (sel ,(format nil "#wx~a" unique-id)) (toggle))
-                                 (-> (sel ,(format nil "#wx~a" unique-id)) (load ,(format nil "/shadow/~a" id)))
-                                 (-> e (prevent-default))))))))
-
-               (:div.icon :id (format nil "favorite-~a" unique-id)
-                          (:span.s7-download))
-               (:div.icon :id (format nil "hide-~a" unique-id)
-                          (:span.s7-close-circle))
-
-               (let* ((label-richtext (jsown:val doc-obj "link_flair_richtext")))
-                 (if label-richtext
-                     (progn
-                       (:br)
-                       (with-html
-                         (:span :class "label pull-right"
-                           :style (format nil "padding:0 5px;font-size:12px;font-weight:500;line-height:16px;white-space:nowrap;display:inline-block;height:16px;vertical-align:middle;background-color:~a;"
-                                          (jsown:val doc-obj "link_flair_background_color"))
-                           (mapcar (lambda (blob)
-                                     (destructure-jsown-object (e (u "u" :safe) (thingy "t" :safe))
-                                         blob
-                                       (cond ((string= e "emoji")
-                                              (:span :style (format nil "display:inline-block;background-position:center;background-repeat:no-repeat;background-size:contain;position:relative;height:15px;width:15px;vertical-align:middle;background-image:url(~a)"
-                                                                    u)))
-                                             ((string= e "text")
-                                              (:span (:raw thingy))))))
-                                   label-richtext)))
-                       (:br)))))
-             (:b
-               (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
-                 :href url (html-entities:decode-entities title)))
-             (:br)
-
-             (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
-               :href (format nil "https://www.reddit.com~a" permalink)
-               author)
-             " "
-             (:div :id (format nil "author-flair-~a" id))
-             (:div :style "font-weight:bold;"
-               (:a :href (format nil "/subreddit/~a/0" subreddit)
-                 subreddit))
-             (:div :id (format nil "awards-~a" id))
-             (:div :class "col-md-12")
+           (:div.panel-heading
+            :style "font-size:11px;padding: 15px 15px 10px;"
+            (:div.tools
+             (:div.icon
+              (:a :id (format nil "hider-~a" unique-id)
+                (:i :class "s7-look")))
              (:script
                (:raw
                 (ps:ps*
-                 `(with-document-ready
-                      (lambda ()
-                        (-> (sel ,(format nil "#favorite-~a" unique-id))
-                            (click (lambda (e)
-                                     (ps:chain (sel ,(format nil "#wx~a" unique-id))
-                                               (load ,(format nil "/link/favorite/~a" id)))
-                                     (-> (sel ,(format nil "#wx~a" unique-id))
-                                         (toggle))
-                                     (-> e (prevent-default)))))
-                        (-> (sel ,(format nil "#hide-~a" unique-id))
-                            (click (lambda (e)
-                                     (let ((selector ,(format nil "#wx~a" unique-id)))
-                                       (-> (sel selector) (fade-out 100
-                                                                    (lambda ()
-                                                                      (ps:chain (sel selector)
-                                                                                (load ,(format nil "/link/hide/~a" (hunchentoot:url-encode id))))
-                                                                      (-> (sel selector) (remove))
-                                                                      (-> e (prevent-default)))))))))))))))
+                 `(-> (sel ,(format nil "#hider-~a" unique-id))
+                      (click (lambda (e)
+                               (-> (sel ,(format nil "#link-~a" unique-id))
+                                   (toggle))
+                               (-> e (prevent-default))))))))
+             (make-author-link link)
+             (:a :style "font-weight:bold;"
+               :target (format nil "win-~a" unique-id)
+               :href (format nil "/link/~a" id)
+               (:div.icon (:span.s7-id)))
+             (:a :style "font-weight:bold;"
+               :target (format nil "json-~a" unique-id)
+               :href (format nil "/json/~a" id)
+               (:div :class "icon" (:i :class "s7-safe")))
+             (:a :id (format nil "shadow-~a" unique-id)
+               (:div :class "icon" (:i :class "s7-trash")))
+             (:script
+               (:raw
+                (ps:ps*
+                 `(-> (sel ,(format nil "#shadow-~a" unique-id))
+                      (click (lambda (e)
+                               (-> (sel ,(format nil "#wx~a" unique-id)) (toggle))
+                               (-> (sel ,(format nil "#wx~a" unique-id)) (load ,(format nil "/shadow/~a" id)))
+                               (-> e (prevent-default))))))))
+
+             (:div.icon :id (format nil "favorite-~a" unique-id)
+                        (:span.s7-download))
+             (:div.icon :id (format nil "hide-~a" unique-id)
+                        (:span.s7-close-circle))
+
+             (let* ((label-richtext (jsown:val doc-obj "link_flair_richtext")))
+               (if label-richtext
+                   (progn
+                     (:br)
+                     (with-html
+                       (:span :class "label pull-right"
+                         :style (format nil "padding:0 5px;font-size:12px;font-weight:500;line-height:16px;white-space:nowrap;display:inline-block;height:16px;vertical-align:middle;background-color:~a;"
+                                        (jsown:val doc-obj "link_flair_background_color"))
+                         (mapcar (lambda (blob)
+                                   (destructure-jsown-object (e (u "u" :safe) (thingy "t" :safe))
+                                       blob
+                                     (cond ((string= e "emoji")
+                                            (:span :style (format nil "display:inline-block;background-position:center;background-repeat:no-repeat;background-size:contain;position:relative;height:15px;width:15px;vertical-align:middle;background-image:url(~a)"
+                                                                  u)))
+                                           ((string= e "text")
+                                            (:span (:raw thingy))))))
+                                 label-richtext)))
+                     (:br)))))
+            (:b
+              (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
+                :href url (html-entities:decode-entities title)))
+            (:br)
+
+            (:a :target (format nil "win-~a" (uuid:make-v4-uuid))
+              :href (format nil "https://www.reddit.com~a" permalink)
+              author)
+            " "
+            (:div :id (format nil "author-flair-~a" id))
+            (:div :style "font-weight:bold;"
+              (:a :href (format nil "/subreddit/~a/0" subreddit)
+                subreddit))
+            (:div :id (format nil "awards-~a" id))
+            (:div :class "col-md-12")
+            (:script
+              (:raw
+               (ps:ps*
+                `(with-document-ready
+                     (lambda ()
+                       (-> (sel ,(format nil "#favorite-~a" unique-id))
+                           (click (lambda (e)
+                                    (ps:chain (sel ,(format nil "#wx~a" unique-id))
+                                              (load ,(format nil "/link/favorite/~a" id)))
+                                    (-> (sel ,(format nil "#wx~a" unique-id))
+                                        (toggle))
+                                    (-> e (prevent-default)))))
+                       (-> (sel ,(format nil "#hide-~a" unique-id))
+                           (click (lambda (e)
+                                    (let ((selector ,(format nil "#wx~a" unique-id)))
+                                      (-> (sel selector) (fade-out 100
+                                                                   (lambda ()
+                                                                     (ps:chain (sel selector)
+                                                                               (load ,(format nil "/link/hide/~a" (hunchentoot:url-encode id))))
+                                                                     (-> (sel selector) (remove))
+                                                                     (-> e (prevent-default)))))))))))))))
            (:script
              (:raw
               (ps:ps*
@@ -1219,16 +1291,19 @@ found.
            (:div :class "panel-heading"
              (:div
                :class "icon comment-trigger"
-               :onclick (ps:ps* `(if (string= (-> (sel ,(format nil "#comments-~a" id))
-                                                  (css "display"))
-                                              "none")
-                                     (progn
+               :onclick (ps:ps* `(progn
+                                   (-> (sel ,(format nil "#comments-~a" id))
+                                       (html "Loading..."))
+                                   (if (string= (-> (sel ,(format nil "#comments-~a" id))
+                                                    (css "display"))
+                                                "none")
+                                       (progn
+                                         (-> (sel ,(format nil "#comments-~a" id))
+                                             (toggle))
+                                         (-> (sel ,(format nil "#comments-~a" id))
+                                             (load ,(format nil "/comments/~a" id))))
                                        (-> (sel ,(format nil "#comments-~a" id))
-                                           (toggle))
-                                       (-> (sel ,(format nil "#comments-~a" id))
-                                           (load ,(format nil "/comments/~a" id))))
-                                     (-> (sel ,(format nil "#comments-~a" id))
-                                         (toggle))))
+                                           (toggle)))))
 
                (:span :class "s7-download")))
            (:div.panel-body :id (format nil "comments-~a" id)
@@ -1380,8 +1455,7 @@ found.
                                 (parent-id "parent_id")
                                 (author-flair-text "author_flair_text")
                                 (body-html "body_html")
-                                (body-text "body_text" :safe)
-                                subreddit)
+                                (body-text "body_text" :safe))
       comment-obj
     (when-let ((db-comment (with-pg (get-dao 'comment id))))
       (with-pg (delete-dao db-comment)))
@@ -1402,7 +1476,8 @@ found.
                                        :body-html comment-text)))
       (with-pg (insert-dao new-comment))
       (update-comment-votes new-comment id score)
-      (log:debug "~a ~a : ~a" author subreddit comment-text))
+      ;;(log:debug "~a ~a : ~a" author subreddit comment-text)
+      )
     (dolist (reply (ignore-errors (jsown:filter replies "data" "children")))
       (destructure-jsown-object (kind data)
           reply
@@ -1418,7 +1493,7 @@ found.
 
 (defun has-commentp (comment-id)
   (ivy:orf (gethash comment-id *seen-comments*)
-       (< 0 (caar (with-pg (query (:select (:count '*) :from 'comment :where (:= 'id comment-id))))))))
+           (< 0 (caar (with-pg (query (:select (:count '*) :from 'comment :where (:= 'id comment-id))))))))
 
 (defun sync-comments ()
   (dolist (link (with-pg (select-dao 'link (:= 'hidden nil))))
@@ -1486,7 +1561,9 @@ found.
 
 (defun new-articles-to-live ()
   (dolist (link (with-pg (query (:order-by
+                                 ;;(:limit)
                                  (:select '* :from 'link :where (:= 'hidden nil))
+
                                  (:asc 'created_utc))
 
                                 (:dao link))))
@@ -1530,11 +1607,12 @@ found.
                   :name "ws broadcast"))
 
 (defun start-ws-server ()
-  (unless *ws-server*
+  (unless (and *ws-server*
+               (hunchentoot:started-p *ws-server*))
     (setf *ws-server* (make-instance 'hunchensocket:websocket-acceptor
                                      :port 9001
                                      :access-log-destination nil))
-   (hunchentoot:start *ws-server*)))
+    (hunchentoot:start *ws-server*)))
 
 (defun check-image (filepath)
   (let* ((filename (file-namestring (path:basename filepath)))
@@ -1556,8 +1634,13 @@ found.
                          :from 'media)
                        :column)))
   (log:info "Cleaning files...")
-  (cl-fad:walk-directory (asdf:system-relative-pathname :sup "images")
-                         #'check-image))
+  (with-lparallel (:workers 12)
+    (let (futures)
+      (cl-fad:walk-directory (asdf:system-relative-pathname :sup "images")
+                             #'(lambda (filepath)
+                                 (push (lparallel:future (check-image filepath)) futures)))
+      (dolist (future futures)
+        (lparallel:force future)))))
 
 (defun cleanup ()
   (labels ((remove-comment-by-parent (parent)
@@ -1733,6 +1816,7 @@ found.
   (setf (hunchentoot:content-type*) "application/json")
   (link-bulk (with-pg (get-dao 'link id))))
 
+
 (defun render/selftext-html (doc)
   (let ((id (jsown:val doc "id")))
     (when-let ((toggle (jsown:val-safe doc "selftext_html")))
@@ -1808,12 +1892,13 @@ found.
       (:div "url-is-mp4"))))
 
 (defun render/imgur-gifv (doc)
-  (when-let ((result (ppcre:scan ".gifv$" (jsown:val-safe doc "url"))))
-    (with-html-string
-      (let ((thing (ppcre:regex-replace ".gifv" result ".mp4")))
-        (:video :preload "none" :class "img-responsive" :controls "1"
-          (:source :src thing))
-        (:div "is-imgur-gifv")))))
+  (let ((url (jsown:val-safe doc "url")))
+    (when-let ((result (ppcre:scan ".gifv$" url)))
+      (with-html-string
+        (let ((thing (ppcre:regex-replace ".gifv" url ".mp4")))
+          (:video :preload "none" :class "img-responsive" :controls "1"
+            (:source :src thing))
+          (:div "is-imgur-gifv"))))))
 
 (defun render/embedded-image (doc)
   (when-let ((result (ignore-errors
@@ -1925,6 +2010,7 @@ found.
       (post-media :link-id (jsown:val doc "id"))
       (:span "just-an-image"))))
 
+
 (defparameter *render-map*
   (list 'render/url-is-mp4
         'render/selftext-html
@@ -1961,22 +2047,23 @@ found.
         (let ((doc (jsown:parse bulk)))
           (render-post doc))))))
 
-;;
-;; 6809 Guru Meditation
-;;
+ ;;
+ ;; 6809 Guru Meditation
+ ;;
 
 (defroute make-history ("/graph/history/:id") ()
   (setf (hunchentoot:content-type*) "application/json")
   (if-let ((history (with-pg (get-dao 'up-history id))))
-    (jsown:to-json (up-history-scores history))
+    (let ((scores (up-history-scores history)))
+      (jsown:to-json `(:obj ("scores" . ,scores)
+                            ("color" . ,(if (<= (aref scores (- (length scores) 1)) 0)
+                                           "red"
+                                           "blue")))))
     "[]"))
 
 (defroute ajax-link ("/singlelink/:id") ()
   (when-let ((link (with-pg (get-dao 'link id))))
-    (with-html-string (display-link link)))
-  ;; (when-let ((item (get-item id)))
-  ;;   (with-html-string (display-link item)))
-  )
+    (with-html-string (display-link link))))
 
 (defroute authors-comments ("/comments/author/:author") ()
   (with-page ()
@@ -2035,21 +2122,21 @@ found.
                             (send "pong"))
                         (progn
                           (let ((env (-> -j-s-o-n (parse (ps:@ event data)))))
-                            (when (string= (ps:@ env action) "update-link")
-                              (let* ((the-id (ps:@ env id))
-                                     (the-selector (+ "#wx" the-id)))
-                                (when (< 0 (ps:@ (sel the-selector) length))
-                                  (-> (sel the-selector) (remove))
-                                  (add-link the-id))))
-                            (when (string= (ps:@ env action) "remove-link")
-                              (remove-link (ps:@ env id)))
-                            (when (string= (ps:@ env action) "add-link")
-                              (add-link (ps:@ env id))
-                              (update-graph (ps:@ env id))
-                              (update-post (ps:@ env id)))
-                            (when (string= (ps:@ env action) "update-graph")
-                              (update-graph (ps:@ env id))
-                              (update-post (ps:@ env id)))))))))
+                            (case (ps:@ env action)
+                              ("update-link" (let* ((the-id (ps:@ env id))
+                                                    (the-selector (+ "#wx" the-id)))
+                                               (when (< 0 (ps:@ (sel the-selector) length))
+                                                 (-> (sel the-selector) (remove))
+                                                 (add-link the-id))))
+                              ("remove-link" (remove-link (ps:@ env id)))
+                              ("add-link" (progn
+                                            (add-link (ps:@ env id))
+                                            (update-graph (ps:@ env id))
+                                            (update-post (ps:@ env id))))
+
+                              ("update-graph" (progn
+                                                (update-graph (ps:@ env id))
+                                                (update-post (ps:@ env id)))))))))))
 
           (defun reset-interface ()
             (-> (ps:@ window ws) (send "reset-interface")))
@@ -2066,7 +2153,7 @@ found.
 
           (defun add-link (link-id)
             (-> $ (ajax (ps:create :type "get"
-                                   :url (concatenate 'string "/singlelink/" link-id)
+                                   :url (+ "/singlelink/" link-id)
                                    :error (lambda (e)
                                             (-> console (log e)))
                                    :success (lambda (text)
@@ -2099,9 +2186,15 @@ found.
   (with-pg
     (query (:select '* :from 'link
              :where (:and (:= 'shadow nil)
+                          (:= 'hidden nil)
                           (:raw (format nil "ts_index @@ websearch_to_tsquery('english','~a')"
                                         searchtext))))
            (:dao link))))
+
+(defun hide-links-by-text (pattern)
+  (dolist (link (get-links-by-text pattern))
+    (mark-link link :read)
+    (send-hide-link (link-id link))))
 
 (defroute search-h ("/search" :method :post) (pattern)
   (log:info "Searching... ~a" pattern)
@@ -2118,14 +2211,13 @@ found.
       (log:info "Cleaning up ~a" filename)
       (delete-file filename))))
 
-
 (defun media-checker ()
   (flet ((check-media (temp-id)
            (let ((media (with-pg (get-dao 'media (car temp-id)))))
              (unless (probe-file (media-path media))
                (with-pg (delete-dao media))))))
     (with-lparallel (:workers 4)
-      (lparallel:pmapcar #'check-media (with-pg (query (:select 'id :from 'media)))))))
+      (lparallel:pmapcar #'check-file (with-pg (query (:select 'id :from 'media)))))))
 
 #+lispworks
 (capi:define-interface wutface-interface () ()
@@ -2159,61 +2251,93 @@ found.
 
 
 
-;; "hacker" news...
+ ;; "hacker" news...
 
-;; (eval-when (:compile-toplevel :load-toplevel :execute)
-;;   (defclass item ()
-;;     ((id :json-key "id")
-;;      (deleted :json-key "deleted")
-;;      (type :json-key "type")
-;;      (by :json-key "by")
-;;      (time :json-key "time")
-;;      (text :json-key "text")
-;;      (dead :json-key "dead")
-;;      (parent :json-key "parent")
-;;      (poll :json-key "poll")
-;;      (kids :json-key "kids"
-;;            :json-type :list)
-;;      (url :json-key "url")
-;;      (score :json-key "score")
-;;      (title :json-key "title")
-;;      (parts :json-key "parts")
-;;      (descendants :json-key "descendants"))
-;;     (:metaclass json-serializable-class)))
+ ;; (eval-when (:compile-toplevel :load-toplevel :execute)
+ ;;   (defclass item ()
+ ;;     ((id :json-key "id")
+ ;;      (deleted :json-key "deleted")
+ ;;      (type :json-key "type")
+ ;;      (by :json-key "by")
+ ;;      (time :json-key "time")
+ ;;      (text :json-key "text")
+ ;;      (dead :json-key "dead")
+ ;;      (parent :json-key "parent")
+ ;;      (poll :json-key "poll")
+ ;;      (kids :json-key "kids"
+ ;;            :json-type :list)
+ ;;      (url :json-key "url")
+ ;;      (score :json-key "score")
+ ;;      (title :json-key "title")
+ ;;      (parts :json-key "parts")
+ ;;      (descendants :json-key "descendants"))
+ ;;     (:metaclass json-serializable-class)))
 
 
-;; (defparameter *hn-cache* (cache:make-cache-table :size 100000
-;;                                                  :test #'equal))
+ ;; (defparameter *hn-cache* (cache:make-cache-table :size 100000
+ ;;                                                  :test #'equal))
 
-;; (defun get-item (item-id)
-;;   (handler-case
-;;       (cache:cache-table-get-or-fill item-id
-;;                                      *hn-cache*
-;;                                      #'(lambda (item-id)
-;;                                          (json-mop:json-to-clos
-;;                                           (raw-http-request
-;;                                            (format nil "https://hacker-news.firebaseio.com/v0/item/~a.json"
-;;                                                    item-id))
-;;                                           'item))
-;;                                      :expire (* 60 60 24))
-;;     (sb-pcl::no-applicable-method-error (condition)
-;;       (declare (ignore condition))
-;;       nil)))
+ ;; (defun get-item (item-id)
+ ;;   (handler-case
+ ;;       (cache:cache-table-get-or-fill item-id
+ ;;                                      *hn-cache*
+ ;;                                      #'(lambda (item-id)
+ ;;                                          (json-mop:json-to-clos
+ ;;                                           (raw-http-request
+ ;;                                            (format nil "https://hacker-news.firebaseio.com/v0/item/~a.json"
+ ;;                                                    item-id))
+ ;;                                           'item))
+ ;;                                      :expire (* 60 60 24))
+ ;;     (sb-pcl::no-applicable-method-error (condition)
+ ;;       (declare (ignore condition))
+ ;;       nil)))
+
+
+ ;; (defun copy-bulks-to-couchdb ()
+ ;;   (let ((link-ids (with-pg (query (:select 'id :from 'link)
+ ;;                                   :column))))
+ ;;     (with-lparallel (:workers 8)
+ ;;       (lparallel:pmap nil (lambda (id)
+ ;;                             (let ((link (with-pg (get-dao 'link id))))
+ ;;                               (mango:doc-put "testing" (link-bulk link))))
+ ;;                       link-ids))))
+
+
+#+:os-macosx
+(defvar *notification-queue* (lparallel.queue:make-queue))
+
+#+:os-macosx
+(defun send-notification (message)
+  (lparallel.queue:push-queue message *notification-queue*))
+
+
+#+:os-macosx
+(defvar *notifications-thread* nil)
+
+#+:os-macosx
+(defun start-notification-thread ()
+  (unless *notifications-thread*
+    (setf *notifications-thread*
+          (bt:make-thread
+           (lambda ()
+             (loop
+               (uiop/launch-program:wait-process
+                (uiop/launch-program:launch-program
+                 (format nil "osascript -e 'display notification \"~a\" with title \"Sup\"'"
+                         (lparallel.queue:pop-queue *notification-queue*))))
+               (sleep 60)))
+           :name "Notifications"))))
 
 (defun start ()
   (read-config)
   (start-server)
   (start-ws-server)
   (start-ws-reader-thread)
-  (start-refresh-threads)
+  (authenticate)
+  ;;(start-refresh-threads)
+
+  ;; #+:os-macosx
+  ;; (start-notification-thread)
+
   (dotimes (x 5)
     (start-media-worker)))
-
-;; (defun copy-bulks-to-couchdb ()
-;;   (let ((link-ids (with-pg (query (:select 'id :from 'link)
-;;                                   :column))))
-;;     (with-lparallel (:workers 8)
-;;       (lparallel:pmap nil (lambda (id)
-;;                             (let ((link (with-pg (get-dao 'link id))))
-;;                               (mango:doc-put "testing" (link-bulk link))))
-;;                       link-ids))))
