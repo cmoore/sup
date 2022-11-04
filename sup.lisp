@@ -1561,11 +1561,9 @@ found.
 
 (defun new-articles-to-live ()
   (dolist (link (with-pg (query (:order-by
-                                 ;;(:limit)
-                                 (:select '* :from 'link :where (:= 'hidden nil))
-
+                                 (:limit (:select '* :from 'link :where (:= 'hidden nil))
+                                         100)
                                  (:asc 'created_utc))
-
                                 (:dao link))))
     (lparallel.queue:push-queue
      (jsown:to-json `(:obj ("action" . "add-link")
